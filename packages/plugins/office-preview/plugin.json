@@ -1,0 +1,111 @@
+{
+  "pluginName": "office-preview",
+  "displayName": "Office 文档预览",
+  "version": "0.4.2",
+  "apiVersion": "1.0",
+  "description": "在文件树里双击 Word（.docx）、Excel（.xlsx）、PowerPoint（.pptx）文件直接预览，不用离开编辑器。Word 排版按原样还原；Excel 支持多工作表、合并单元格与配色，大表格也流畅；PPT 支持缩略图导航与缩放。只读，不修改文件。",
+  "icon": "fileText",
+  "category": "tool",
+  "dependencies": [
+    "nodejs"
+  ],
+  "installType": "standard",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "contributes": {
+    "panels": [
+      {
+        "id": "preview",
+        "title": "文档预览",
+        "panelKind": "floating",
+        "userManaged": false,
+        "content": {
+          "type": "html",
+          "src": "preview.html"
+        },
+        "process": "office-preview-server"
+      },
+      {
+        "id": "sheet",
+        "title": "表格预览",
+        "panelKind": "floating",
+        "userManaged": false,
+        "content": {
+          "type": "html",
+          "src": "sheet.html"
+        },
+        "process": "office-preview-server"
+      },
+      {
+        "id": "slides",
+        "title": "演示文稿预览",
+        "panelKind": "floating",
+        "userManaged": false,
+        "content": {
+          "type": "html",
+          "src": "slides.html"
+        },
+        "process": "office-preview-server"
+      }
+    ],
+    "commands": [],
+    "events": [],
+    "mcpTools": [
+      {
+        "name": "preview_document",
+        "process": "office-preview-server",
+        "description": "Locate a Word (.docx), Excel (.xlsx), or PowerPoint (.pptx) file in the workspace and report where it is. Use when the user asks to see/read/preview a document. Read-only. Note: the preview panel must be opened by the user double-clicking the file in the file tree.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "Absolute path to the .docx / .xlsx file (or path relative to the workspace root)."
+            }
+          },
+          "required": [
+            "file"
+          ]
+        }
+      }
+    ],
+    "skills": [],
+    "fileTypes": [
+      {
+        "extensions": [
+          "docx"
+        ],
+        "panelId": "preview"
+      },
+      {
+        "extensions": [
+          "xlsx"
+        ],
+        "panelId": "sheet"
+      },
+      {
+        "extensions": [
+          "pptx"
+        ],
+        "panelId": "slides"
+      }
+    ]
+  },
+  "processes": [
+    {
+      "id": "office-preview-server",
+      "command": "node",
+      "args": [
+        "server.cjs"
+      ],
+      "env": {
+        "CLAUDE_PLUGIN_WORKSPACE": "${workspace}"
+      },
+      "portProtocol": "PLUGIN_PORT="
+    }
+  ],
+  "settings": {}
+}

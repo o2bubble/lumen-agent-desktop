@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>文档预览</title>
+<style>
+  :root {
+    --bg: #1b1b1f;
+    --fg: #d8d8dc;
+    --muted: #8a8a92;
+    --panel: #232327;
+    --border: #34343a;
+    --accent: #d9a441;
+  }
+  html.theme-light {
+    --bg: #f6f6f7;
+    --fg: #26262b;
+    --muted: #6b6b73;
+    --panel: #ffffff;
+    --border: #e0e0e4;
+    --accent: #b8860b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* 顶栏：文件名 + 缩放 */
+  .bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .bar button:hover { border-color: var(--accent); }
+  .zoom { color: var(--muted); min-width: 40px; text-align: center; }
+
+  /* 文档区 */
+  #stage {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 16px;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+  }
+
+  /* docx-preview 生成的 section 自带白底与阴影，这里只补一下尺寸约束 */
+  #stage .docx-wrapper {
+    background: transparent !important;
+    padding: 0 !important;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  #stage .docx-wrapper > section.docx {
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.28);
+    margin: 0 auto;
+  }
+
+  /* 状态页（加载中 / 错误 / 未选文件） */
+  .state {
+    margin: auto;
+    text-align: center;
+    color: var(--muted);
+    max-width: 480px;
+    line-height: 1.8;
+  }
+  .state b { color: var(--fg); font-weight: 600; }
+  .state code {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 12px;
+  }
+  .err { color: #e5645f; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <span class="name" id="name">—</span>
+    <button id="zoomOut" title="缩小">−</button>
+    <span class="zoom" id="zoomLabel">100%</span>
+    <button id="zoomIn" title="放大">+</button>
+    <button id="fit" title="适应宽度">适应</button>
+  </div>
+  <div id="stage">
+    <div class="state" id="state">等待文件…</div>
+  </div>
+
+<!-- JSZip 是 docx-preview 的运行时依赖（docx 本质是 zip 包）。
+     必须放在它前面：docx-preview 在模块初始化时就找全局 JSZip，
+     缺了会报 "Cannot read properties of undefined (reading 'loadAsync')"。 -->
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/docx-preview.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var qs = new URLSearchParams(location.search);
+  var port = qs.get("port");
+  var API = port ? "http://127.0.0.1:" + port : null;
+
+  var stage = document.getElementById("stage");
+  var stateEl = document.getElementById("state");
+  var nameEl = document.getElementById("name");
+  var zoomLabel = document.getElementById("zoomLabel");
+
+  var currentFile = null;
+  var zoom = 1;
+
+  function applyTheme(t) {
+    if (t === "light") document.documentElement.classList.add("theme-light");
+    else document.documentElement.classList.remove("theme-light");
+  }
+  applyTheme(qs.get("theme"));
+
+  function setState(html, isError) {
+    stage.innerHTML = "";
+    var d = document.createElement("div");
+    d.className = "state" + (isError ? " err" : "");
+    d.innerHTML = html;
+    stage.appendChild(d);
+    stateEl = d;
+  }
+
+  function applyZoom() {
+    var secs = stage.querySelectorAll("section.docx");
+    for (var i = 0; i < secs.length; i++) {
+      secs[i].style.zoom = String(zoom);
+    }
+    zoomLabel.textContent = Math.round(zoom * 100) + "%";
+  }
+
+  // ── 读参数：URL query（首帧） + 宿主 postMessage（增量更新）──
+  function decodeParams(b64) {
+    try {
+      var std = b64.replace(/-/g, "+").replace(/_/g, "/");
+      while (std.length % 4) std += "=";
+      return JSON.parse(decodeURIComponent(escape(atob(std))));
+    } catch (e) { return null; }
+  }
+
+  function showOldDocHint() {
+    setState(
+      "这是旧版 <b>.doc</b> 格式（不是 .docx），浏览器里无法渲染。<br><br>" +
+      "· 用 Word 打开后「另存为」<b>.docx</b> 即可预览<br>" +
+      "· 或右键文件树里的文件 →「在资源管理器中显示」，用桌面程序打开",
+      true
+    );
+  }
+
+  function render(payload) {
+    var file = payload && payload.file;
+    if (!file) {
+      setState("从左侧文件树双击一个 <b>.docx</b> 文件即可预览。");
+      return;
+    }
+    if (file === currentFile) return;   // 同一个文件重渲染没意义
+    currentFile = file;
+
+    nameEl.textContent = file.split(/[\\/]/).pop() || file;
+    nameEl.title = file;
+
+    if (!API) {
+      setState("插件后台进程没有启动（缺少 <code>port</code> 参数）。<br>请检查插件是否正常运行。", true);
+      return;
+    }
+
+    // .doc（OLE 老格式）docx-preview 不认 —— 在发请求前就拦掉，
+    // 省一次传输并给出可操作的提示
+    var ext0 = (file.split(".").pop() || "").toLowerCase();
+    if (ext0 === "doc") {
+      showOldDocHint();
+      return;
+    }
+
+    setState("正在加载…");
+
+    fetch(API + "/file?path=" + encodeURIComponent(file))
+      .then(function (r) {
+        if (!r.ok) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            throw new Error(j.error || ("HTTP " + r.status));
+          });
+        }
+        return r.arrayBuffer();
+      })
+      .then(function (buf) {
+        stage.innerHTML = "";
+        return window.docx.renderAsync(buf, stage, null, {
+          className: "docx",
+          inWrapper: true,
+          ignoreWidth: false,
+          ignoreHeight: false,
+          breakPages: true,
+          renderHeaders: true,
+          renderFooters: true,
+          useBase64URL: true,
+        });
+      })
+      .then(function () {
+        applyZoom();
+      })
+      .catch(function (e) {
+        var msg = String(e && e.message || e);
+        if (/outside workspace/i.test(msg)) {
+          setState("这个文件不在当前工作区内，出于安全考虑不读取。", true);
+        } else if (/not found/i.test(msg)) {
+          setState("文件不存在或已被移动。", true);
+        } else {
+          setState("解析失败：<code>" + msg.replace(/[<>&]/g, "") + "</code>", true);
+        }
+      });
+  }
+
+  window.addEventListener("message", function (e) {
+    var d = e.data;
+    if (!d || typeof d !== "object" || d.source !== "plugin:host") return;
+    if (d.kind === "theme") { applyTheme(d.payload && d.payload.theme); return; }
+    if (d.kind === "params" && d.payload) render(d.payload);
+  });
+
+  // 缩放
+  document.getElementById("zoomIn").onclick = function () {
+    zoom = Math.min(3, zoom + 0.1); applyZoom();
+  };
+  document.getElementById("zoomOut").onclick = function () {
+    zoom = Math.max(0.3, zoom - 0.1); applyZoom();
+  };
+  document.getElementById("fit").onclick = function () {
+    // 按第一页宽度贴合可视区
+    var sec = stage.querySelector("section.docx");
+    if (!sec) { zoom = 1; applyZoom(); return; }
+    var natural = sec.offsetWidth / zoom;   // 抵消当前 zoom 得到原始宽度
+    var avail = stage.clientWidth - 36;
+    if (natural > 0) { zoom = Math.max(0.3, Math.min(2, avail / natural)); applyZoom(); }
+  };
+
+  var initial = qs.get("params") ? decodeParams(qs.get("params")) : null;
+  if (initial) render(initial);
+  else setState("从左侧文件树双击一个 <b>.docx</b> 文件即可预览。");
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,90 @@
+.env
+.env.*
+!.env.example
+node_modules
+.claude/settings.local.json
+.claude/active-profile
+.claude/profile.env
+bin/bun.exe
+src/utils/vendor/
+extensions/vscode/.claude/settings.local.json
+refs/
+bin.zip
+*.bak
+*.tsbuildinfo
+**/.vs/
+**/bin/
+!/bin/cla-bypass.cmd
+!/bin/claude-gui.cmd
+!/bin/cla.cmd
+!/bin/claude.cmd
+!/bin/claude-haha.cmd
+!/bin/claude-ide.cmd
+!/bin/claude-profile.cmd
+!/bin/cdp-browser.cmd
+!/bin/cdp-setup.cmd
+!/bin/codegraph-cleanup.cmd
+!/bin/kill-claude.cmd
+!/bin/*.ps1
+**/obj/
+**/UpgradeLog*.htm
+.codegraph/
+/dist/
+temp/
+.playwright-mcp/
+.scratch/
+claude-code-gui-release-platform/feedback-images/
+claude-code-gui-release-platform/updates-store/
+docs/memory-export/
+offline-tools/
+# tools/ 下只保留**自己写的配置与文档**；第三方二进制一律忽略。
+# 用白名单（先全忽略再逐项放行）—— 靠扩展名枚举会漏掉解压出来的无扩展名
+# Linux 二进制（实测 cloudflared-linux-amd64 38MB 差点被提交）。
+# 需要二进制时按 `docs/cloudflare-tunnel-*.md` 里的命令重新下载。
+tools/*
+!tools/cloudflared/
+tools/cloudflared/*
+!tools/cloudflared/config-*.yml
+__pycache__/
+# 运行环境诊断等功能相关的运行时/实例文件
+.mcp.json
+.claude/
+*.bun-build
+gui/prototypes/
+gui/src/prototypes/
+
+# Codex 本地工具配置（保留但不跟踪）
+.codex/
+AGENTS.md
+
+# 插件运行期数据目录（dev 下由插件进程写在 repo 根；
+# 安装环境下宿主用的是 %APPDATA%/com.claudecode.gui/plugins-data/，不受此条影响）
+plugins-data/
+
+# memsearch 插件运行期状态（本机索引状态 + PID，不跨机共享）
+.memsearch/
+
+# 私有（含 API key 等敏感值，勿提交）
+.private/
+
+# mac 发布产物 —— release_mac.py make 从 gui.zip 内嵌 manifest 派生，
+# 每次发布内容不同，不是源码
+scripts/manifest.json
+
+# 构建产物
+/dist/
+
+# 二进制资产（本地构建用，不入库）
+/offline-tools/
+/bin/*.exe
+
+# 依赖
+node_modules/
+**/node_modules/
+
+# Rust
+**/target/
+
+# 环境
+.env
+.env.*

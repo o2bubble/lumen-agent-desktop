@@ -1,0 +1,5 @@
+name: "office-preview"
+author: "官方"
+version: "0.4.2"
+description: "在文件树里双击 Word（.docx）、Excel（.xlsx）、PowerPoint（.pptx）文件直接预览，不用离开编辑器。Word 排版按原样还原；Excel 支持多工作表、合并单元格与配色，大表格也流畅；PPT 支持缩略图导航与缩放。只读，不修改文件。"
+tags: ["office", "word", "docx", "excel", "xlsx", "ppt", "pptx", "preview", "文档", "表格", "演示", "预览"]

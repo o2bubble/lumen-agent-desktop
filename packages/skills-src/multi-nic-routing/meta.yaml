@@ -1,0 +1,5 @@
+name: "multi-nic-routing"
+author: "官方"
+version: "1.1.0"
+description: "多网卡分流 —— 让公网走热点/WiFi、内网走有线，解决公司网络访问外网断流、下载卡住、连不上云端。改之前自动备份并生成一键还原脚本，随时可撤销。"
+tags: ["网络", "路由", "多网卡", "分流", "热点", "断流", "network", "routing", "multi-nic", "windows"]

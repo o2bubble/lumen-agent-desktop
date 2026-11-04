@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>表格预览</title>
+<style>
+  :root {
+    --bg: #1b1b1f;
+    --fg: #d8d8dc;
+    --muted: #8a8a92;
+    --panel: #232327;
+    --border: #34343a;
+    --accent: #d9a441;
+    --sheet-bg: #ffffff;
+  }
+  html.theme-light {
+    --bg: #f6f6f7;
+    --fg: #26262b;
+    --muted: #6b6b73;
+    --panel: #ffffff;
+    --border: #e0e0e4;
+    --sheet-bg: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 13px/1.4 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── 顶栏 ── */
+  .bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    height: 32px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34%; }
+  .sep { color: var(--muted); }
+  .tabs { display: flex; gap: 2px; overflow-x: auto; flex: 1 1 auto; }
+  .tabs::-webkit-scrollbar { height: 0; }
+  .tab {
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    color: var(--muted);
+    border-radius: 4px 4px 0 0;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tab:hover { color: var(--fg); }
+  .tab.on {
+    color: var(--fg);
+    background: var(--bg);
+    border-color: var(--border);
+  }
+  .bar button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    min-width: 28px;
+  }
+  .bar button:hover { border-color: var(--accent); }
+  .zoom { color: var(--muted); min-width: 42px; text-align: center; font-variant-numeric: tabular-nums; }
+  .info { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  /* ── 表格区 ──
+     结构照抄库的 Vue 壳：scroller 是原生滚动容器，spacer 撑开滚动范围，
+     canvas 与四象限 overlay 绝对定位在上面。 */
+  #wrap { flex: 1 1 auto; position: relative; min-height: 0; overflow: hidden; }
+  #scroller {
+    position: absolute; inset: 0;
+    overflow: auto;
+    background: var(--sheet-bg);
+  }
+  #scroller::-webkit-scrollbar { width: 12px; height: 12px; }
+  #scroller::-webkit-scrollbar-thumb { background: #8884; border-radius: 6px; }
+  #scroller::-webkit-scrollbar-thumb:hover { background: #8888; }
+  /*
+     canvas 必须在 scroller **内部**（不是兄弟节点）：
+     放外面时会盖在滚动容器上方，把滚轮/拖动事件全吃掉 ——
+     用户表现为「滚不动、左右也动不了」（2026-11-03 实测）。
+     sticky 让它固定在视口左上，滚动时只重绘内容、不跟着跑。
+     spacer 负责撑开滚动条范围。 */
+  #cv { position: sticky; top: 0; left: 0; display: block; z-index: 1; }
+  #spacer { display: block; width: 1px; height: 1px; }
+  .ov { position: absolute; pointer-events: none; overflow: hidden; }
+  #ovMain { inset: 0; }
+  #ovFrow { top: 0; left: 0; right: 0; }
+  #ovFcol { top: 0; left: 0; bottom: 0; }
+  #ovCorner { top: 0; left: 0; }
+  #editorSlot { position: absolute; inset: 0; pointer-events: none; z-index: 30; }
+  #editorSlot > * { pointer-events: auto; }
+  #cellTip {
+    position: absolute; display: none; pointer-events: none;
+    background: #333; color: #eee; font-size: 12px;
+    padding: 3px 6px; border-radius: 3px; max-width: 420px;
+    white-space: pre-wrap; z-index: 20;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+
+  /* 状态页 */
+  .state {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; text-align: center; color: var(--muted);
+    line-height: 1.9; padding: 24px; z-index: 10;
+    background: var(--bg);
+  }
+  .state > div { max-width: 520px; }
+  .state b { color: var(--fg); }
+  .state code {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 3px; padding: 1px 5px; font-size: 12px;
+  }
+  .err { color: #e5645f; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <span class="name" id="name">—</span>
+    <span class="sep">|</span>
+    <div class="tabs" id="tabs"></div>
+    <span class="info" id="info"></span>
+    <button id="zoomOut" title="缩小">−</button>
+    <span class="zoom" id="zoomLabel">100%</span>
+    <button id="zoomIn" title="放大">+</button>
+    <button id="resetZoom" title="恢复 100%">重置</button>
+  </div>
+
+  <div id="wrap">
+    <div id="scroller">
+      <canvas id="cv"></canvas>
+      <div id="spacer"></div>
+    </div>
+    <div class="ov" id="ovMain"></div>
+    <div class="ov" id="ovFrow"></div>
+    <div class="ov" id="ovFcol"></div>
+    <div class="ov" id="ovCorner"></div>
+    <div id="editorSlot"></div>
+    <div id="cellTip"></div>
+    <div class="state" id="state"><div>等待文件…</div></div>
+  </div>
+
+<script type="module">
+const qs = new URLSearchParams(location.search);
+const PORT = qs.get("port");
+const API = PORT ? "http://127.0.0.1:" + PORT : null;
+
+const nameEl = document.getElementById("name");
+const tabsEl = document.getElementById("tabs");
+const infoEl = document.getElementById("info");
+const zoomLabel = document.getElementById("zoomLabel");
+const scroller = document.getElementById("scroller");
+const spacer = document.getElementById("spacer");
+const canvas = document.getElementById("cv");
+const wrapEl = document.getElementById("wrap");
+const tipEl = document.getElementById("cellTip");
+
+let core = null;
+let workbook = null;
+let ctrl = null;          // ViewerController
+let curSheet = 0;
+let zoom = 1;
+let currentFile = null;
+
+function applyTheme(t) {
+  document.documentElement.classList.toggle("theme-light", t === "light");
+}
+applyTheme(qs.get("theme"));
+
+function showState(html, isError) {
+  let d = document.getElementById("state");
+  if (!d) {
+    d = document.createElement("div");
+    d.className = "state";
+    d.id = "state";
+    wrapEl.appendChild(d);
+  }
+  d.style.display = "";
+  d.className = "state" + (isError ? " err" : "");
+  d.innerHTML = "<div>" + html + "</div>";
+}
+function hideState() {
+  const d = document.getElementById("state");
+  if (d) d.style.display = "none";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (c) =>
+    c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;");
+}
+
+function decodeParams(b64) {
+  try {
+    let s = b64.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    return JSON.parse(decodeURIComponent(escape(atob(s))));
+  } catch { return null; }
+}
+
+/** 把控制器接起来。结构参考库的 Vue 壳（els + hooks）。 */
+function mountController() {
+  const els = {
+    canvas,
+    renderArea: wrapEl,
+    scroller,
+    spacer,
+    overlays: {
+      main: document.getElementById("ovMain"),
+      frow: document.getElementById("ovFrow"),
+      fcol: document.getElementById("ovFcol"),
+      corner: document.getElementById("ovCorner"),
+    },
+    editorSlot: document.getElementById("editorSlot"),
+  };
+  const hooks = {
+    onRenderer: () => {},
+    onRenderTick: () => {},
+    onSelectionChange: () => {},
+    onCellClick: () => {},
+    onCellDblClick: () => {},
+    onHyperlink: (url) => { if (url) window.open(url, "_blank", "noopener"); },
+    onTooltip: (tip) => {
+      if (!tip) { tipEl.style.display = "none"; return; }
+      tipEl.textContent = tip.text;
+      tipEl.style.display = "block";
+      tipEl.style.left = Math.min(tip.x + 12, wrapEl.clientWidth - 200) + "px";
+      tipEl.style.top = (tip.y + 16) + "px";
+    },
+    onFindChange: () => {},
+    onFilterChange: () => {},
+  };
+  ctrl = new core.ViewerController(els, hooks);
+
+  // 🔴 控制器**不会自己绑鼠标/键盘事件** —— 它只在构造时绑了 scroll/paste/touch。
+  // 选区、点选、拖选、键盘翻页全靠壳把这些事件转给它的 on* 方法（见 Vue 壳的
+  // `onMousedown: ba, onMousemove: Ca, ...`）。
+  // 漏绑的表现：**点什么都没反应，getSelection() 永远是 null**（2026-11-03 实测）。
+  //
+  // ⚠️ 必须绑在 scroller 上（和 Vue 壳一致），不能绑 canvas ——
+  // canvas 只是绘制表面，滚动条的交互仍然发生在 scroller。
+  scroller.tabIndex = 0;   // 让它可聚焦，否则 keydown 收不到
+  scroller.addEventListener("scroll", () => {
+    ctrl.setScroll(scroller.scrollLeft, scroller.scrollTop);
+  });
+  scroller.addEventListener("mousedown", (e) => ctrl.onMouseDown(e));
+  scroller.addEventListener("mousemove", (e) => ctrl.onMouseMove(e));
+  scroller.addEventListener("mouseup", (e) => ctrl.onMouseUp(e));
+  scroller.addEventListener("mouseleave", () => ctrl.onMouseLeave());
+  scroller.addEventListener("dblclick", (e) => ctrl.onDblClick(e));
+  scroller.addEventListener("keydown", (e) => ctrl.onKeyDown(e));
+  scroller.addEventListener("contextmenu", (e) => ctrl.onContextMenu(e));
+
+  let spaceDown = false;   // 空格按住 = 临时平移模式（声明必须在使用它的 mousedown 之前）
+
+  // ── 按住拖动平移 ──
+  //
+  // 横向滚动只靠滚轮很别扭（多数鼠标没有横向滚轮）。表格预览里
+  // 「按住拖动」是最自然的平移方式。
+  //
+  // 用中键或 空格+左键：**不能用裸左键** —— 左键已经被控制器用于选单元格，
+  // 抢掉会让"点选/拖选"彻底失效。
+  let dragging = null;
+  wrapEl.addEventListener("mousedown", (e) => {
+    if (e.button !== 1 && !(e.button === 0 && spaceDown)) return;
+    e.preventDefault();
+    dragging = {
+      x: e.clientX, y: e.clientY,
+      left: scroller.scrollLeft, top: scroller.scrollTop,
+    };
+    wrapEl.style.cursor = "grabbing";
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    scroller.scrollLeft = dragging.left - (e.clientX - dragging.x);
+    scroller.scrollTop = dragging.top - (e.clientY - dragging.y);
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = null;
+    wrapEl.style.cursor = "";
+  });
+
+  // 空格按住 = 临时进入"手型平移"（和 Photoshop/设计工具一致）
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && !/^(INPUT|TEXTAREA)$/.test(e.target.tagName)) {
+      e.preventDefault();          // 空格默认会滚动页面，会和平移打架
+      spaceDown = true;
+      wrapEl.style.cursor = "grab";
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space") {
+      spaceDown = false;
+      if (!dragging) wrapEl.style.cursor = "";
+    }
+  });
+
+  // ── 复制（Ctrl+C / Cmd+C）──
+  //
+  // 库提供了 `copySelection()`，但**没有内建键盘绑定** —— 实测按 Ctrl+C
+  // 剪贴板里还是上一次的内容（用户反馈"选中了但复制不出来"）。
+  //
+  // 绑在 document 上而不是 canvas：焦点可能在 body 上（canvas 不可聚焦），
+  // 而且用户在面板里任何位置按 Ctrl+C 都期望复制当前选中的格子。
+  // ⚠️ 必须用 **keydown + preventDefault** 而不是等浏览器的 copy 事件 ——
+  // Ctrl+C 默认会清空剪贴板再尝试复制页面选区（canvas 上无文字 → 结果为空），
+  // 会和我们的异步 `copySelection()` 抢写，实测偶尔剪贴板变成空。
+  //
+  // 绑在 scroller 上（它有 tabIndex，能收到键盘事件）。
+  scroller.addEventListener("keydown", (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    if (!mod || e.altKey || e.shiftKey) return;
+    if (e.key !== "c" && e.key !== "C") return;
+
+    const sel = ctrl.getSelection();
+    if (!sel) return;                 // 没选中任何格子 → 保持浏览器默认行为
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // ⚠️ 单格 vs 多格走不同路径 —— 实测单格 `copySelection()` 偶尔不落剪贴板
+    // （多格同一位置是好的），大概是单格分支的 ClipboardItem 构造有差异。
+    // 单格内容就是一段文字，直接写 text/plain 最稳，也满足"复制个文字"的诉求。
+    const single = sel.top === sel.bottom && sel.left === sel.right;
+    if (single) {
+      // `getCellText(sheet, row, col)` 返回**格式化后的显示文本**
+      // （比如日期显示成 2026-11-03，而不是序列号 45961）
+      let text = "";
+      try {
+        text = core.getCellText(workbook.sheets[curSheet], sel.top, sel.left) || "";
+      } catch { /* 取不到就走库的实现 */ }
+
+      if (text !== undefined) {
+        navigator.clipboard.writeText(text).catch(() => {
+          ctrl.copySelection().catch(() => {});
+        });
+        return;
+      }
+    }
+
+    // 多格：自己拼 TSV 写进剪贴板。
+    //
+    // 本来想用库的 `copySelection()`（能带 HTML 样式，贴进 Excel 保格式），
+    // 但它**静默失败**——不 reject、剪贴板却为空，实测连续 3 次全挂。
+    // 而 `navigator.clipboard.writeText` 稳定可用。
+    // 取舍：放弃"贴进 Excel 保样式"，保证"复制出来一定能用"。
+    try {
+      const rows = [];
+      for (let r = sel.top; r <= sel.bottom; r++) {
+        const line = [];
+        for (let c = sel.left; c <= sel.right; c++) {
+          line.push(core.getCellText(workbook.sheets[curSheet], r, c) || "");
+        }
+        rows.push(line.join("\t"));
+      }
+      navigator.clipboard.writeText(rows.join("\n")).catch(() => {});
+    } catch { /* 取文本失败就算了，不影响其它功能 */ }
+  });
+
+  const ro = new ResizeObserver(() => {
+    if (!ctrl) return;
+    ctrl.measure();
+    ctrl.render();
+  });
+  ro.observe(wrapEl);
+}
+
+function showSheet(idx) {
+  if (!workbook || !ctrl) return;
+  curSheet = idx;
+  [...tabsEl.children].forEach((b, i) => b.classList.toggle("on", i === idx));
+  const sheet = workbook.sheets[idx];
+  // 尺寸在 sheet.dimension.{rows,cols}（不是 rowCount/colCount —— 这两个字段不存在）
+  if (sheet && sheet.dimension) {
+    infoEl.textContent = sheet.dimension.rows + " 行 × " + sheet.dimension.cols + " 列";
+  } else {
+    infoEl.textContent = "";
+  }
+  scroller.scrollTop = 0;
+  scroller.scrollLeft = 0;
+  ctrl.rebuild(sheet, workbook, zoom, {});
+  ctrl.render();
+}
+
+function setZoom(z) {
+  zoom = Math.max(0.3, Math.min(3, z));
+  zoomLabel.textContent = Math.round(zoom * 100) + "%";
+  if (ctrl) { ctrl.setZoom(zoom); ctrl.render(); }
+}
+
+document.getElementById("zoomIn").onclick = () => setZoom(zoom + 0.1);
+document.getElementById("zoomOut").onclick = () => setZoom(zoom - 0.1);
+document.getElementById("resetZoom").onclick = () => setZoom(1);
+
+wrapEl.addEventListener("wheel", (e) => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  setZoom(zoom + (e.deltaY < 0 ? 0.1 : -0.1));
+}, { passive: false });
+
+async function load(file) {
+  if (!file || file === currentFile) return;
+  currentFile = file;
+  nameEl.textContent = file.split(/[\\/]/).pop() || file;
+  nameEl.title = file;
+
+  if (!API) {
+    showState("插件后台进程没有启动（缺少 <code>port</code> 参数）。", true);
+    return;
+  }
+
+  const ext = (file.split(".").pop() || "").toLowerCase();
+  if (ext === "xls") {
+    showState(
+      "这是旧版 <b>.xls</b> 格式，浏览器里无法解析。<br><br>" +
+      "· 用 Excel 打开后「另存为」<b>.xlsx</b> 即可预览<br>" +
+      "· 或右键文件树里的文件 →「在资源管理器中显示」，用桌面程序打开", true);
+    return;
+  }
+
+  try {
+    if (!core) {
+      showState("正在加载渲染引擎…");
+      core = await import("./vendor/ooxml/core.js");
+    }
+
+    showState("正在读取文件…");
+    const r = await fetch(API + "/file?path=" + encodeURIComponent(file));
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || ("HTTP " + r.status));
+    }
+    const buf = await r.arrayBuffer();
+
+    showState("正在解析…");
+    workbook = await core.openWorkbook(buf);
+
+    if (!workbook.sheets || !workbook.sheets.length) {
+      showState("这个工作簿里没有工作表。", true);
+      return;
+    }
+
+    tabsEl.innerHTML = "";
+    workbook.sheets.forEach((s, i) => {
+      const b = document.createElement("button");
+      b.className = "tab";
+      b.textContent = s.name;
+      b.title = s.name;
+      b.onclick = () => showSheet(i);
+      tabsEl.appendChild(b);
+    });
+
+    if (!ctrl) mountController();
+    hideState();
+    showSheet(0);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/outside workspace/i.test(msg)) {
+      showState("这个文件不在当前工作区内，出于安全考虑不读取。", true);
+    } else if (/not found/i.test(msg)) {
+      showState("文件不存在或已被移动。", true);
+    } else if (/invalid zip|corrupt|encrypted/i.test(msg)) {
+      showState("文件已损坏或被加密，无法预览。", true);
+    } else {
+      showState("解析失败：<code>" + esc(msg) + "</code>", true);
+    }
+  }
+}
+
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || typeof d !== "object" || d.source !== "plugin:host") return;
+  if (d.kind === "theme") { applyTheme(d.payload && d.payload.theme); return; }
+  if (d.kind === "params" && d.payload) load(d.payload.file);
+});
+
+const initial = qs.get("params") ? decodeParams(qs.get("params")) : null;
+if (initial) load(initial.file);
+else showState("从左侧文件树双击一个 <b>.xlsx</b> 文件即可预览。");
+</script>
+</body>
+</html>
