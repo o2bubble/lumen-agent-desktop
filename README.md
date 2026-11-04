@@ -1,4 +1,4 @@
-# Claude Code GUI
+# Lumen Agent Desktop
 
 桌面客户端：Tauri 2 + React，为 [Claude Code](https://github.com/anthropics/claude-code) 提供图形界面。
 
@@ -58,7 +58,7 @@ bun run build/build.ts --claude-from <path/to/claude.exe>
 bun run <claude-repo>/build/joint.ts --gui-repo <this-repo>
 ```
 
-一条命令产出一整套（GUI + CLI + Python + Git + 工具链），manifest 统一生成。
+一条命令产出一整套（桌面端 + CLI + Python + Git + 工具链），manifest 统一生成。
 
 ### 产物
 
