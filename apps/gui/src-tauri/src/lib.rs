@@ -744,6 +744,9 @@ pub fn run() {
             // CLI 工具提示词同步（同模式）：install-tools 在 Windows 注入过文本表格，
             // mac 手动 .app 无 install-tools，靠 GUI 启动把 cli-tools.md 同步 + 注入 @cli-tools.md。
             settings::sync_cli_tools();
+            // deliver 提醒 hook：改完文件却不调 deliver 时拦一下。工具是 GUI 专属
+            // （super-desktop MCP），所以修复也随 GUI 分发。每次启动幂等安装。
+            settings::sync_deliver_hook();
 
             // Windows: kill the IDE backend synchronously when the user logs off
             // or shuts down. tao never forwards WM_QUERYENDSESSION, so without

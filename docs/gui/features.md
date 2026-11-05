@@ -231,7 +231,13 @@
 - **怎么用**：选中文字后点「发送到聊天框」（追加到输入框末尾）/「回复」（把原文复制到输入框并补上引号与结尾括号，光标停在中间）/「复制」；若选中内容里有文件路径，还会出现「📂 在资源管理器中打开 (N)」下拉（路径不存在时提示）。可在 设置 → 聊天 →「消息划词工具栏」关闭。
 - **来源**：`gui/src/components/chat/SelectionToolbar.tsx`
 
-### 3.14 任务列表（后台任务）
+### 3.14 交付卡片
+- **是什么**：AI 改完文件后，会在回复末尾列出这次**创建 / 修改 / 删除**的文件，渲染成可点的卡片。点文本文件进编辑器，点图片 / PDF 直接预览。
+- **怎么用**：无需操作，AI 收尾时自动交付。卡片长期留在会话里，之后想回顾改了什么往上翻即可。
+- **为什么有时它会「被强制」交付一次**：`deliver` 的调用时机原本只写在工具说明里，实测会漏（改完文件直接结束）。GUI 因此在 `~/.claude/settings.json` 注册了一个 **Stop hook**：本轮用过 `Edit`/`Write` 却始终没交付时，拦住会话让 AI 补上。已知盲区：通过终端命令（`rm`、`mv`、`git checkout`）改的文件检测不到。想关掉就删掉 `settings.json` 里指向 `deliver-reminder.sh` 的那条 Stop hook（下次启动 GUI 会重新安装）。
+- **来源**：`gui/src/services/deliverSpec.ts`、`gui/src-tauri/hooks/deliver-reminder.py`、`gui/src-tauri/src/settings.rs`（`sync_deliver_hook`）
+
+### 3.15 任务列表（后台任务）
 - **是什么**：AI 启动的后台任务（Bash 后台命令、子代理等）会列在输入框上方，显示状态、工具数、token 数。
 - **怎么用**：运行中的任务右侧有 ✕「终止任务」按钮；任务列表为空时该区域不显示。
 - **来源**：`gui/src/components/chat/TasksPanel.tsx`
