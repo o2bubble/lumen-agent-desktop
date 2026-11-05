@@ -237,7 +237,14 @@
 - **为什么有时它会「被强制」交付一次**：`deliver` 的调用时机原本只写在工具说明里，实测会漏（改完文件直接结束）。GUI 因此在 `~/.claude/settings.json` 注册了一个 **Stop hook**：本轮用过 `Edit`/`Write` 却始终没交付时，拦住会话让 AI 补上。已知盲区：通过终端命令（`rm`、`mv`、`git checkout`）改的文件检测不到。想关掉就删掉 `settings.json` 里指向 `deliver-reminder.sh` 的那条 Stop hook（下次启动 GUI 会重新安装）。
 - **来源**：`gui/src/services/deliverSpec.ts`、`gui/src-tauri/hooks/deliver-reminder.py`、`gui/src-tauri/src/settings.rs`（`sync_deliver_hook`）
 
-### 3.15 任务列表（后台任务）
+### 3.15 回合收尾检查（Stop hook）
+- **是什么**：每轮对话结束前，自动检查两件事，没做干净就拦住让 AI 补：① 本轮的待办清单（todo）里还有没标完成的项；② 改过文件却没交付清单。
+- **怎么用**：无需操作，自动运行。要关掉就删 `~/.claude/settings.json` 里指向 `deliver-reminder.sh` 的那条 Stop hook —— 但下次启动 GUI 会重新装回。每条提醒**只拦一次**：AI 解释清楚（比如你说「剩下的不做了」）后再结束就放行，不会反复纠缠。
+- **todo 检查**是全局的（命令行会话也有）；**交付检查**只在插了 super-desktop 的会话里生效（纯命令行没有 `deliver` 工具）。
+- **已知盲区**：通过终端命令（`rm`、`mv`、`git checkout`）改的文件，交付检查看不到。
+- **来源**：`gui/src-tauri/hooks/deliver-reminder.py`、`gui/src-tauri/src/settings.rs`（`sync_deliver_hook`）
+
+### 3.16 任务列表（后台任务）
 - **是什么**：AI 启动的后台任务（Bash 后台命令、子代理等）会列在输入框上方，显示状态、工具数、token 数。
 - **怎么用**：运行中的任务右侧有 ✕「终止任务」按钮；任务列表为空时该区域不显示。
 - **来源**：`gui/src/components/chat/TasksPanel.tsx`
