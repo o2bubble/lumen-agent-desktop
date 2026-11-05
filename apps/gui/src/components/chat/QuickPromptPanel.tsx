@@ -1,9 +1,15 @@
 import { useState } from "react";
-import { Plus, Send, Trash2, Edit3, X, Check } from "lucide-react";
+import { Plus, Send, Trash2, Edit3, X, Check, GripVertical } from "lucide-react";
 import { getSettings, updateSettings, saveSettings, type QuickPrompt } from "../../stores/settingsStore";
 import { useEvent } from "../../services/useService";
 import { Events, type SettingsChangedPayload } from "../../services/events";
 import { commandRegistry, windowBus } from "../../services/windowBus";
+import {
+  computeDropIndex,
+  moveItem,
+  neighborIndex,
+  type DropPosition,
+} from "../../services/quickPromptReorder";
 import { showCtxMenu } from "../ContextMenu";
 import { t } from "../../i18n";
 
@@ -14,6 +20,10 @@ export default function QuickPromptPanel() {
   const [editing, setEditing] = useState<string | null>(null); // "new" or prompt.id
   const [editTitle, setEditTitle] = useState("");
   const [editPrompt, setEditPrompt] = useState("");
+  /** 正在拖动的提示 id（null = 没在拖） */
+  const [dragId, setDragId] = useState<string | null>(null);
+  /** 拖到哪一行的哪一半 —— 决定插入线画在上面还是下面 */
+  const [dropHint, setDropHint] = useState<{ id: string; position: DropPosition } | null>(null);
 
   const persist = (list: QuickPrompt[]) => {
     updateSettings({ quickPrompts: list });
@@ -55,6 +65,24 @@ export default function QuickPromptPanel() {
     persist(prompts.filter((p) => p.id !== id));
   };
 
+  /** 拖放落位。位置计算全在 quickPromptReorder.ts（有单测）。 */
+  const handleDrop = (targetId: string, position: DropPosition) => {
+    setDropHint(null);
+    if (!dragId || dragId === targetId) return;
+    const from = prompts.findIndex((p) => p.id === dragId);
+    const to = computeDropIndex(prompts, dragId, targetId, position);
+    if (from < 0 || to < 0) return;
+    persist(moveItem(prompts, from, to));
+  };
+
+  /** 右键菜单里的上移/下移 —— 拖拽之外的另一种调序方式（也方便窄面板）。 */
+  const moveBy = (id: string, direction: "up" | "down") => {
+    const from = prompts.findIndex((p) => p.id === id);
+    const to = neighborIndex(prompts.length, from, direction);
+    if (to < 0) return;
+    persist(moveItem(prompts, from, to));
+  };
+
   const sendPrompt = (promptText: string) => {
     commandRegistry.execute("SEND_MESSAGE", promptText);
   };
@@ -65,9 +93,13 @@ export default function QuickPromptPanel() {
 
   const onContextMenu = (e: React.MouseEvent, p: QuickPrompt) => {
     e.preventDefault();
+    const idx = prompts.findIndex((x) => x.id === p.id);
     showCtxMenu(e.clientX, e.clientY, [
       { label: t("quickPrompts.send"), action: () => sendPrompt(p.prompt) },
       { label: t("quickPrompts.insertToInput"), action: () => insertToInput(p.prompt) },
+      { separator: true as any },
+      { label: t("quickPrompts.moveUp"), disabled: idx <= 0, action: () => moveBy(p.id, "up") },
+      { label: t("quickPrompts.moveDown"), disabled: idx >= prompts.length - 1, action: () => moveBy(p.id, "down") },
       { separator: true as any },
       { label: t("quickPrompts.edit"), action: () => { setEditing(p.id); setEditTitle(p.title); setEditPrompt(p.prompt); } },
       { label: t("quickPrompts.delete"), action: () => deletePrompt(p.id) },
@@ -172,15 +204,52 @@ export default function QuickPromptPanel() {
             {t("quickPrompts.empty")}
           </div>
         )}
-        {prompts.map((p) => (
+        {prompts.map((p) => {
+          const hint = dropHint?.id === p.id ? dropHint.position : null;
+          const dragging = dragId === p.id;
+          return (
           <div
             key={p.id}
             onClick={() => sendPrompt(p.prompt)}
             onContextMenu={(e) => onContextMenu(e, p)}
+            draggable
+            onDragStart={(e) => {
+              e.stopPropagation();
+              setDragId(p.id);
+              // Firefox 要求设 dataTransfer 才会真的开始拖
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", p.id);
+            }}
+            onDragEnd={() => { setDragId(null); setDropHint(null); }}
+            onDragOver={(e) => {
+              if (!dragId || dragId === p.id) return;
+              e.preventDefault();
+              e.dataTransfer.dropEffect = "move";
+              // 落在上半 → 插到它前面；下半 → 插到它后面
+              const r = e.currentTarget.getBoundingClientRect();
+              setDropHint({ id: p.id, position: e.clientY < r.top + r.height / 2 ? "before" : "after" });
+            }}
+            onDragLeave={(e) => {
+              // 只在真正离开这一行时清 —— 移进子元素也会触发 dragleave
+              if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+              setDropHint((h) => (h?.id === p.id ? null : h));
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handleDrop(p.id, hint ?? "after");
+            }}
             style={{
               display: "flex", alignItems: "center",
               padding: "8px 12px", cursor: "pointer",
               borderBottom: "1px solid var(--border-light)",
+              opacity: dragging ? 0.4 : 1,
+              // 插入指示线：画在行内上/下边缘，不动布局
+              boxShadow: hint === "before"
+                ? "inset 0 2px 0 0 var(--accent)"
+                : hint === "after"
+                  ? "inset 0 -2px 0 0 var(--accent)"
+                  : undefined,
             }}
             onMouseEnter={(e) => {
               e.currentTarget.style.background = "var(--accent-subtle)";
@@ -190,6 +259,11 @@ export default function QuickPromptPanel() {
             }}
             title={p.prompt}
           >
+            {/* 抓手：暗示这一行可以拖。低对比度，不抢主体信息。 */}
+            <GripVertical
+              size={12}
+              style={{ color: "var(--fg-muted)", opacity: 0.45, marginRight: 4, flexShrink: 0, cursor: "grab" }}
+            />
             <Send size={13} style={{ color: "var(--accent)", marginRight: 8, flexShrink: 0 }} />
             <span style={{
               flex: 1, fontSize: 13, color: "var(--fg-primary)",
@@ -229,7 +303,8 @@ export default function QuickPromptPanel() {
               <Trash2 size={12} />
             </button>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

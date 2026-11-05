@@ -527,6 +527,8 @@ const en: Locale = {
     empty: 'No quick prompts yet. Click "New" to create one.',
     cancel: "Cancel",
     save: "Save",
+    moveUp: "Move up",
+    moveDown: "Move down",
   },
   placeholder: {
     chatMain: "Chat — open in main window",

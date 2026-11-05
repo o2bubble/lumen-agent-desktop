@@ -526,6 +526,8 @@ const zh = {
     empty: '还没有快捷提示，点击"新建"创建',
     cancel: "取消",
     save: "保存",
+    moveUp: "上移",
+    moveDown: "下移",
   },
   placeholder: {
     chatMain: "Chat — 请在主窗口中打开",
