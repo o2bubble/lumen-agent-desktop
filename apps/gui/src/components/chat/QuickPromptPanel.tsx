@@ -13,6 +13,22 @@ import {
 import { showCtxMenu } from "../ContextMenu";
 import { t } from "../../i18n";
 
+/**
+ * 本面板拖拽用的自定义 MIME。
+ *
+ * dragover 阶段**读不到 data，只能读 types** —— 所以必须靠一个自定义类型
+ * 来区分"自己拖自己"和"从外面拖进来一个文件"，否则会误接外部拖拽。
+ * MIME 类型大小写不敏感，`types` 里返回的是小写，这里也用小写。
+ */
+const DRAG_MIME = "application/x-quick-prompt-id";
+
+function isOwnDrag(e: React.DragEvent): boolean {
+  const types = e.dataTransfer?.types;
+  if (!types) return false;
+  for (let i = 0; i < types.length; i++) if (types[i] === DRAG_MIME) return true;
+  return false;
+}
+
 export default function QuickPromptPanel() {
   const payload = useEvent<SettingsChangedPayload>(Events.SETTINGS_CHANGED);
   const prompts: QuickPrompt[] = payload?.settings?.quickPrompts ?? getSettings().quickPrompts ?? [];
@@ -73,6 +89,15 @@ export default function QuickPromptPanel() {
     const to = computeDropIndex(prompts, dragId, targetId, position);
     if (from < 0 || to < 0) return;
     persist(moveItem(prompts, from, to));
+  };
+
+  /** 拖到列表空白处 → 移到末尾。 */
+  const moveToEnd = () => {
+    if (!dragId) return;
+    const from = prompts.findIndex((p) => p.id === dragId);
+    if (from < 0 || from === prompts.length - 1) return;
+    persist(moveItem(prompts, from, prompts.length - 1));
+    setDropHint(null);
   };
 
   /** 右键菜单里的上移/下移 —— 拖拽之外的另一种调序方式（也方便窄面板）。 */
@@ -195,7 +220,24 @@ export default function QuickPromptPanel() {
       )}
 
       {/* Prompt list */}
-      <div style={{ flex: 1, overflow: "auto" }}>
+      <div
+        style={{ flex: 1, overflow: "auto" }}
+        // 整片列表区域都接住自己的拖拽 —— 只给「行」加 preventDefault 的话，
+        // 拖到自己身上或空白处时浏览器会显示**禁止光标**（no-drop）。
+        onDragOver={(e) => {
+          if (!isOwnDrag(e)) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        }}
+        onDrop={(e) => {
+          if (!isOwnDrag(e)) return;
+          e.preventDefault();
+          // 落在空白区（不在任何一行上）→ 移到末尾
+          if (!(e.target as HTMLElement).closest("[data-qp-row]")) {
+            moveToEnd();
+          }
+        }}
+      >
         {prompts.length === 0 && !editing && (
           <div style={{
             padding: "24px 12px", textAlign: "center",
@@ -210,21 +252,27 @@ export default function QuickPromptPanel() {
           return (
           <div
             key={p.id}
+            data-qp-row
             onClick={() => sendPrompt(p.prompt)}
             onContextMenu={(e) => onContextMenu(e, p)}
             draggable
             onDragStart={(e) => {
               e.stopPropagation();
               setDragId(p.id);
-              // Firefox 要求设 dataTransfer 才会真的开始拖
               e.dataTransfer.effectAllowed = "move";
+              // 自定义 MIME：dragover 阶段拿不到 data，只能看 types ——
+              // 用它识别「这是本面板发起的拖拽」，而不是外部拖进来的文件。
+              e.dataTransfer.setData(DRAG_MIME, p.id);
+              // Firefox 不设 text/plain 时可能不开始拖
               e.dataTransfer.setData("text/plain", p.id);
             }}
             onDragEnd={() => { setDragId(null); setDropHint(null); }}
             onDragOver={(e) => {
-              if (!dragId || dragId === p.id) return;
+              if (!isOwnDrag(e)) return;
+              // **先接住**：拖到自己身上也要 preventDefault，否则显示禁止光标
               e.preventDefault();
               e.dataTransfer.dropEffect = "move";
+              if (dragId === p.id) return;
               // 落在上半 → 插到它前面；下半 → 插到它后面
               const r = e.currentTarget.getBoundingClientRect();
               setDropHint({ id: p.id, position: e.clientY < r.top + r.height / 2 ? "before" : "after" });
