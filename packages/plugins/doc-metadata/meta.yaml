@@ -1,5 +1,5 @@
 name: "doc-metadata"
 author: "官方"
-version: "0.1.0"
-description: "AI 生成文档后自动抹除文件里的元信息（作者/公司/版本号/修订号/时间/缩略图），并回读验证。覆盖 Word / Excel / PPT / PDF / 图片"
+version: "0.1.1"
+description: "AI 生成文档后自动抹除文件里的元信息（作者/公司/版本号/修订号/时间/缩略图），并回读验证。覆盖 Word / Excel / PPT / PDF / 图片。属性面板里的「计算机」是本机名，系统现场算出、不随文件外传，清理后仍显示属正常"
 tags: ["metadata", "privacy", "office", "pdf", "exif", "plugin"]

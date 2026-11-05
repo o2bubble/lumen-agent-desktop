@@ -1,9 +1,9 @@
 {
   "pluginName": "doc-metadata",
   "displayName": "文档元信息清理",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "apiVersion": "1.0",
-  "description": "AI 生成文档后，自动抹除文件里的元信息 —— 作者、公司、版本号、修订号、创建/修改时间、缩略图。覆盖 Word / Excel / PPT / PDF / 图片。抹完会回读验证，没清干净就拦住会话让 AI 补，不会让你拿着一份看着正常、实际带着内部信息的文件发出去。",
+  "description": "AI 生成文档后，自动抹除文件里的元信息 —— 作者、公司、版本号、修订号、创建/修改时间、缩略图。覆盖 Word / Excel / PPT / PDF / 图片。抹完会回读验证，没清干净就拦住会话让 AI 补。注意：属性面板里的「计算机」显示的是你本机名，由系统现场算出、不随文件外传，清理后仍会显示 —— 正常，不是插件没清干净。",
   "icon": "broom",
   "category": "tool",
   "installType": "standard",
