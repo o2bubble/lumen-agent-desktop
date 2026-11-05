@@ -8,16 +8,35 @@
 
 ## 这是什么
 
-Claude Code 本身是一个命令行工具。这个仓库提供一个桌面外壳：把它的能力放进带面板的图形界面里，
-并补上 CLI 没有的东西 —— 无限画布（超级桌面）、笔记、文件预览、插件市场、GUI 专属 MCP 工具
-（`deliver` 交付卡片、`desktop_*` 画布操作等）。
+Claude Code 本身是一个命令行工具。这个仓库提供一个桌面外壳：把它的能力放进带面板的图形界面里，并补上 CLI 没有的东西 —— 无限画布（超级桌面）、笔记、文件预览、插件市场、GUI 专属 MCP 工具（`deliver` 交付卡片、`desktop_*` 画布操作等）。
 
-## 目录
+## 主要功能
+
+- **多面板工作台**：聊天、代码编辑器、文件树、终端、超级桌面（无限画布）、笔记、子代理
+- **IDE 插件生态**：支持 VS Code、Visual Studio、IntelliJ IDEA 等主流 IDE
+- **MCP 工具集成**：
+  - Memory：跨会话记忆库
+  - Office：操作 Excel/Word/PPT 文档
+  - CDP Inspector：浏览器实时渲染检查器
+  - 等等...
+- **插件市场**：内置 GUI 插件（git-viewer、pointer、office-preview 等）
+- **技能系统**：随包分发的技能源
+
+## 目录结构
 
 ```
 apps/
   gui/                 Tauri 桌面客户端（Rust + React）
-  extensions/          IDE 插件（VS Code / VS / IntelliJ / CDP）
+  extensions/          IDE 插件
+    vscode/            VS Code 插件
+    intellij/          IntelliJ IDEA 插件
+    office/            Office MCP 工具
+    memory/            跨会话记忆 MCP
+    cdp-inspector/     CDP 检查器 MCP
+    vs/                Visual Studio 插件
+    cli-tools/         CLI 工具
+    handoff-compact/   交接工具
+    python/            Python 环境
   release-platform/    自托管更新服务器
 packages/
   plugins/             GUI 插件（git-viewer / pointer / office-preview …）
@@ -27,7 +46,7 @@ build/
   engine.ts            发布引擎（manifest / zip / 复用校验）
   installer/           Inno Setup 安装器
   updater/             更新器（Windows）
-docs/                  设计文档、架构说明、复盘
+docs/                  设计文档、架构说明
 ```
 
 ## 构建
@@ -47,8 +66,7 @@ cd apps/gui && bun install
 bun run build/build.ts --claude-from <path/to/claude.exe>
 ```
 
-`--claude-from` 指向一个已构建好的 `claude` 二进制。**不给也能构建** —— 产物可以运行，
-只是没有 CLI 后端，聊天面板不可用。
+`--claude-from` 指向一个已构建好的 `claude` 二进制。**不给也能构建** —— 产物可以运行，只是没有 CLI 后端，聊天面板不可用。
 
 ### 与 CLI 仓联合构建（推荐，产物完整）
 
@@ -81,8 +99,7 @@ cargo tauri dev    # 完整桌面调试
 
 ## 架构
 
-见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。GUI 与后端之间走 WebSocket；
-画布、笔记等状态由 Rust 侧持久化到 SQLite；MCP 工具通过内置 HTTP 服务器暴露给模型。
+见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。GUI 与后端之间走 WebSocket；画布、笔记等状态由 Rust 侧持久化到 SQLite；MCP 工具通过内置 HTTP 服务器暴露给模型。
 
 ## 相关
 
