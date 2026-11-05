@@ -24,6 +24,7 @@ function manifest(name: string, fileTypes: any[]): PluginManifest {
       mcpTools: [],
       skills: [],
       fileTypes,
+      hooks: {},
     },
     processes: [],
     category: "tool",

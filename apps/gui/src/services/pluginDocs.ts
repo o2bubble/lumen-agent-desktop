@@ -46,6 +46,28 @@ export const PLUGIN_DOCS = `# Claude Code GUI 插件系统 — AI 指南
   - 约束：\`name\` 只允许字母数字与 \`-_.\`（防路径穿越）；
     \`path\` 必须是插件目录内的相对路径；目标目录须含 \`SKILL.md\`
   - ⚠️ **技能在会话启动时扫描** —— 装完要**新开会话**才看得到（与面板/命令"立刻可见"不同）
+- contributes.hooks（可选）: 让**引擎**在某个时机跑插件里的脚本。
+  与 beforeUninstall 的区别：那个是宿主生命周期，这个是 claude.exe 的钩子。
+  \`\`\`json
+  "hooks": {
+    "Stop": [{ "script": "sanitize.py", "runner": "python", "timeout": 120 }],
+    "PostToolUse": [{ "script": "check.py", "matcher": "Write|Edit" }]
+  }
+  \`\`\`
+  - 键 = 引擎事件名：PreToolUse / PostToolUse / PostToolUseFailure / Stop /
+    SubagentStop / SessionStart / SessionEnd / UserPromptSubmit / Notification /
+    PreCompact / PostCompact。**写错的键会被丢弃**（否则钩子永不触发且无人知道）
+  - \`script\` 必须是插件目录内的相对路径（绝对路径 / \`..\` 一律拒绝）
+  - \`runner\`：python | bun | bash，缺省按扩展名推断（.py→python，.sh→bash，其余→bun）。
+    运行时由 GUI 安装包自带，无需依赖 nodejs 插件
+  - \`timeout\`：秒，1–300，缺省 30
+  - \`matcher\`：仅工具类事件有效（如 \`"Write|Edit"\`）
+  - 宿主在**每次插件重扫**时全量对账：把 \`~/.claude/settings.json\` 里所有**命令指向
+    插件根目录**的条目清掉，再按当前启用插件重建。插件卸载/禁用 → 钩子自动消失；
+    用户自己的钩子不受影响
+  - Python 脚本会收到 \`--plugin <name> --settings-dir <AppData>/plugins-settings\`，
+    用它读插件设置（全局 + 工作区覆盖）
+  - ⚠️ **钩子配置在会话启动时快照** —— 装完要**新开会话**才生效
 - 进程声明（可选）: "processes": [{ "id": "srv", "command": "node",
   "args": ["server.cjs"], "env": {}, "startOn": "workspace_bound" }]
   **command 与 args 必须分开** —— 平台用 \`Command::new(command)\` 直接 spawn，

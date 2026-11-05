@@ -1,0 +1,59 @@
+{
+  "pluginName": "doc-metadata",
+  "displayName": "文档元信息清理",
+  "version": "0.1.0",
+  "apiVersion": "1.0",
+  "description": "AI 生成文档后，自动抹除文件里的元信息 —— 作者、公司、版本号、修订号、创建/修改时间、缩略图。覆盖 Word / Excel / PPT / PDF / 图片。抹完会回读验证，没清干净就拦住会话让 AI 补，不会让你拿着一份看着正常、实际带着内部信息的文件发出去。",
+  "icon": "broom",
+  "category": "tool",
+  "installType": "standard",
+  "dependencies": [],
+  "platforms": ["windows", "macos", "linux"],
+  "contributes": {
+    "panels": [],
+    "commands": [],
+    "events": [],
+    "mcpTools": [],
+    "hooks": {
+      "Stop": [
+        {
+          "script": "sanitize.py",
+          "runner": "python",
+          "timeout": 120
+        }
+      ]
+    }
+  },
+  "processes": [],
+  "settings": {
+    "scope": {
+      "type": "select",
+      "title": "处理范围",
+      "description": "touched = 只处理本轮 AI 明确操作过的文件（最安全）；newOnly = 工作区里本轮新建的文件，旧文件不动；workspace = 工作区里本轮改动过的所有文件。",
+      "default": "touched",
+      "options": [
+        { "value": "touched", "label": "只处理本轮碰过的文件" },
+        { "value": "newOnly", "label": "只处理本轮新建的文件" },
+        { "value": "workspace", "label": "工作区内本轮改动过的文件" }
+      ]
+    },
+    "author": {
+      "type": "string",
+      "title": "抹除后写入的作者",
+      "description": "留空 = 彻底删掉作者字段。想保留一个统一署名（比如公司名或「匿名」）就填在这里。",
+      "default": ""
+    },
+    "company": {
+      "type": "string",
+      "title": "抹除后写入的公司",
+      "description": "留空 = 删掉公司字段。",
+      "default": ""
+    },
+    "keepTimestamps": {
+      "type": "boolean",
+      "title": "保留创建 / 修改时间",
+      "description": "默认连时间一起抹掉。如果文档需要保留时间线（比如归档），打开它。",
+      "default": false
+    }
+  }
+}

@@ -31,6 +31,7 @@ mod guard;
 mod instances;
 mod mcp;
 mod migrations;
+mod plugin_hooks;
 mod plugin_process;
 mod prockill;
 mod settings;
@@ -848,6 +849,7 @@ pub fn run() {
             get_platform,
             get_plugin_settings,
             save_plugin_settings,
+            plugin_hooks::sync_plugin_hooks,
             verify_plugin_signature,
             verify_plugin_digest,
             app_relaunch,

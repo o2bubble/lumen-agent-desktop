@@ -78,6 +78,33 @@ export interface PluginContributes {
   skills: PluginSkillDecl[];
   /** 文件类型关联 —— 双击这类文件时由本插件接管预览（见 PluginFileType）。 */
   fileTypes: PluginFileType[];
+  /** 贡献给引擎的钩子（写进 ~/.claude/settings.json，见 syncPluginHooks）。 */
+  hooks: PluginHooks;
+}
+
+/**
+ * 插件贡献的引擎钩子。
+ *
+ * 与 `beforeUninstall` 的区别：那个是**宿主生命周期**（卸载时跑一次）；
+ * 这是**引擎钩子** —— 由 claude.exe 在回合结束/工具调用等时机执行，必须写进
+ * `~/.claude/settings.json` 才生效。
+ *
+ * 宿主在**每次插件重扫**时做全量对账（同 skills 的做法）：插件在 → 钩子在；
+ * 插件卸载或被禁用 → 钩子清。不依赖"安装时写一次"，手改坏了下次重扫自愈。
+ *
+ * 键 = 引擎钩子事件名（`Stop` / `PreToolUse` / `PostToolUse` / `SessionStart` 等）。
+ */
+export type PluginHooks = Record<string, PluginHookDecl[]>;
+
+export interface PluginHookDecl {
+  /** 插件目录内的脚本，相对路径（绝对路径 / `..` 穿越会被拒）。 */
+  script: string;
+  /** 解释器。缺省按扩展名推断：.py→python，.sh→bash，其余→bun。 */
+  runner?: "python" | "bun" | "bash";
+  /** 超时秒数（1–300，缺省 30）。 */
+  timeout?: number;
+  /** 工具类事件的可选 matcher（如 `"Write|Edit"`）。Stop 等事件忽略。 */
+  matcher?: string;
 }
 
 /**
@@ -316,6 +343,7 @@ export function parsePluginManifest(json: string, sourceDir: string): ParseResul
     mcpTools: parseMcpTools(contributesRaw.mcpTools, processes),
     skills: parsePluginSkills(contributesRaw.skills),
     fileTypes,
+    hooks: parsePluginHooks(contributesRaw.hooks),
   };
 
   // 可选扩展字段（T8）: 分类/依赖/安装形态——容错解析, 缺省回落默认。
@@ -538,6 +566,63 @@ export function parsePluginSkills(raw: unknown): PluginSkillDecl[] {
     }
     seen.add(name);
     out.push({ name, path });
+  }
+  return out;
+}
+
+/** 引擎认识的事件名。写错的键会被静默忽略（钩子永不触发），所以在解析期就挡掉。 */
+const KNOWN_HOOK_EVENTS = new Set([
+  "PreToolUse", "PostToolUse", "PostToolUseFailure",
+  "Stop", "SubagentStop", "SessionStart", "SessionEnd",
+  "UserPromptSubmit", "Notification", "PreCompact", "PostCompact",
+]);
+
+const HOOK_RUNNERS = new Set(["python", "bun", "bash"]);
+
+/** 按扩展名推断解释器 —— 与宿主运行 beforeUninstall 的约定一致。 */
+export function hookRunnerFor(script: string): "python" | "bun" | "bash" {
+  const lower = script.toLowerCase();
+  if (lower.endsWith(".py")) return "python";
+  if (lower.endsWith(".sh")) return "bash";
+  return "bun";
+}
+
+/**
+ * 解析 `contributes.hooks` —— 容错：坏条目**跳过**而不是让整个插件装不上
+ * （钩子写错不该连面板都用不了）。但 script 指向插件目录之外时一律拒绝。
+ */
+export function parsePluginHooks(raw: unknown): PluginHooks {
+  if (!isRecord(raw)) return {};
+  const out: PluginHooks = {};
+  for (const [event, list] of Object.entries(raw)) {
+    if (!KNOWN_HOOK_EVENTS.has(event)) {
+      console.warn(`[plugin] hooks: 未知事件 "${event}"（支持 ${[...KNOWN_HOOK_EVENTS].join("/")}）`);
+      continue;
+    }
+    if (!Array.isArray(list)) continue;
+    const decls: PluginHookDecl[] = [];
+    for (const item of list) {
+      if (!isRecord(item)) continue;
+      const script = asString(item.script);
+      const scriptAbsolute =
+        !!script && (script.startsWith("/") || script.startsWith("\\") || /^[A-Za-z]:/.test(script));
+      const scriptTraversal = !!script && script.split(/[/\\]/).includes("..");
+      if (!script || scriptAbsolute || scriptTraversal) {
+        console.warn(`[plugin] hooks: 跳过非法 script "${script}"（${event}）`);
+        continue;
+      }
+      const runnerRaw = asString(item.runner);
+      const runner = runnerRaw && HOOK_RUNNERS.has(runnerRaw)
+        ? (runnerRaw as PluginHookDecl["runner"])
+        : hookRunnerFor(script);
+      const timeoutRaw = typeof item.timeout === "number" && Number.isFinite(item.timeout)
+        ? Math.round(item.timeout)
+        : 30;
+      const timeout = Math.min(300, Math.max(1, timeoutRaw));
+      const matcher = asString(item.matcher);
+      decls.push({ script, runner, timeout, ...(matcher ? { matcher } : {}) });
+    }
+    if (decls.length > 0) out[event] = decls;
   }
   return out;
 }
@@ -1031,6 +1116,10 @@ export async function reloadPlugins(): Promise<void> {
     // 放在每次重扫里而不是"安装时建一次"—— 用户手删了链接、插件被手工挪走，
     // 下次重扫都会自愈。失败只告警：skill 不可用不该阻断插件本身。
     await syncPluginSkillLinks(manifests);
+    // contributes.hooks → ~/.claude/settings.json（同样幂等对账）。
+    // 卸载/禁用后钩子要跟着消失，否则一个已删插件的脚本还在每轮被调用。
+    const { syncPluginHooks } = await import("./pluginHooksSync");
+    await syncPluginHooks(manifests);
     const {
       stopPluginEventForwarding, startPluginEventForwarding, registerPluginCommands,
     } = await import("./pluginCommandBridge");
