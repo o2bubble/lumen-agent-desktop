@@ -4,18 +4,22 @@
 //
 // 已读状态存在本地 settings（`readAnnouncementIds`），服务端不记录。
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Marked } from "marked";
 import { t } from "../../i18n";
 import {
   getCached,
   refreshAnnouncements,
+  isRead,
   markRead,
   markAllRead,
   type Announcement,
   type AnnouncementLevel,
 } from "../../services/announcementService";
 import { notifyAnnouncementsChanged } from "../../services/announcementBadge";
+import { computeAnnouncementViewState } from "../../services/announcementViewState";
+import { getSettings } from "../../stores/settingsStore";
+import { getFloatingPanels, removeFloatingPanel } from "../../stores/layoutStore";
 
 /** 三级各自的强调色 —— critical 用红，important 用橙，info 用中性。 */
 const LEVEL_STYLE: Record<AnnouncementLevel, { color: string; label: () => string }> = {
@@ -49,10 +53,29 @@ function renderAnnouncementBody(body: string): string {
   return md.parse(body) as string;
 }
 
+/**
+ * 面板若托管在浮窗里，关掉那个浮窗。
+ *
+ * 不依赖 Toolbar 的 `openAnnouncementFloat`（会引入反向依赖）——
+ * 直接按 panelId 在浮窗列表里找自己。找不到（面板被嵌进主区域）就什么都不做。
+ */
+function closeSelfIfFloating(): void {
+  const fp = getFloatingPanels().find((f) =>
+    f.group.tabs.some(
+      (tab) =>
+        tab.panelId === "announcement" ||
+        tab.children?.some((c) => c.panelId === "announcement"),
+    ),
+  );
+  if (fp) removeFloatingPanel(fp.id);
+}
+
 export function AnnouncementPanel() {
   const [items, setItems] = useState<Announcement[]>(() => getCached());
   const [loading, setLoading] = useState(items.length === 0);
   const [error, setError] = useState<string | null>(null);
+  // 已读状态存在 settings 里（不是 React state），改完要递增这个计数来触发重渲染。
+  const [readTick, setReadTick] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -67,24 +90,40 @@ export function AnnouncementPanel() {
     return () => { cancelled = true; };
   }, []);
 
-  // 打开面板即视为读过当前的 —— 这是"常驻铃铛"最常见的预期
-  useEffect(() => {
-    if (!items.length) return;
-    markAllRead(items);
-    notifyAnnouncementsChanged();
-  }, [items]);
+  // ⚠️ **打开面板不再自动标记全部已读**。
+  // 之前的逻辑是「打开即全读」—— 面板一弹出，红点就没了，用户根本没看内容。
+  // 现在改成一题一读：点哪条读哪条；只有「全部已读」才批量标记。
 
-  const handleAllRead = () => {
+  // readTick 让「已读状态（存在 settings 里）变化」能触发重渲染
+  const view = useMemo(
+    () => computeAnnouncementViewState(items, new Set(getSettings().readAnnouncementIds ?? [])),
+    [items, readTick],
+  );
+  const { unreadCount, showMarkAllRead } = view;
+
+  const handleReadOne = useCallback((uuid: string) => {
+    if (isRead(uuid)) return;
+    markRead(uuid);
+    notifyAnnouncementsChanged();
+    setReadTick((n) => n + 1);
+  }, []);
+
+  /** 全部已读 → 标记后**自动关闭面板**（用户点这个就是"看完了，可以关"）。 */
+  const handleAllRead = useCallback(() => {
     markAllRead(items);
     notifyAnnouncementsChanged();
-    setItems([...items]);   // 触发重渲染
-  };
+    setReadTick((n) => n + 1);
+    closeSelfIfFloating();
+  }, [items]);
 
   return (
     <div style={S.root}>
       <div style={S.header}>
-        <span style={S.title}>{t("announcement.title")}</span>
-        {items.length > 0 && (
+        <span style={S.title}>
+          {t("announcement.title")}
+          {unreadCount > 0 && <span style={S.count}>{unreadCount}</span>}
+        </span>
+        {showMarkAllRead && (
           <button type="button" style={S.linkBtn} onClick={handleAllRead}>
             {t("announcement.markAllRead")}
           </button>
@@ -102,19 +141,34 @@ export function AnnouncementPanel() {
       )}
 
       <div style={S.list}>
-        {items.map((a) => {
+        {view.rows.map(({ announcement: a, unread }) => {
           const lv = LEVEL_STYLE[a.level] ?? LEVEL_STYLE.info;
+          const read = !unread;
           return (
             <article
               key={a.uuid}
-              style={{ ...S.item, borderLeftColor: lv.color }}
-              onClick={() => markRead(a.uuid)}
+              style={{
+                ...S.item,
+                // 未读：左侧色条用等级色 + 底色提亮 + 标题加粗；
+                // 已读：色条转灰、底色回落、整体降一档对比度。
+                ...(read ? S.itemRead : S.itemUnread),
+                borderLeftColor: read ? "var(--border-medium)" : lv.color,
+              }}
+              onClick={() => handleReadOne(a.uuid)}
+              title={read ? undefined : t("announcement.clickToRead")}
             >
               <div style={S.itemHead}>
-                <span style={{ ...S.badge, color: lv.color, borderColor: lv.color }}>
+                <span
+                  style={{
+                    ...S.badge,
+                    color: read ? "var(--fg-muted)" : lv.color,
+                    borderColor: read ? "var(--border-medium)" : lv.color,
+                  }}
+                >
                   {lv.label()}
                 </span>
-                <span style={S.itemTitle}>{a.title}</span>
+                <span style={read ? S.itemTitleRead : S.itemTitle}>{a.title}</span>
+                {!read && <span style={S.unreadDot} aria-label={t("announcement.unread")} />}
                 <span style={S.time}>{fmtTime(a.created_at)}</span>
               </div>
               {a.body && (
@@ -166,7 +220,19 @@ const S: Record<string, React.CSSProperties> = {
     padding: "10px 14px",
     borderBottom: "1px solid var(--border-light)",
   },
-  title: { fontWeight: 600 },
+  title: { fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6 },
+  /** 未读数角标 —— 与工具栏铃铛的口径一致（同一个 unreadCount 算法）。 */
+  count: {
+    fontSize: 10,
+    lineHeight: "14px",
+    minWidth: 14,
+    padding: "0 4px",
+    borderRadius: 7,
+    background: "var(--accent)",
+    color: "var(--fg-inverse)",
+    textAlign: "center",
+    fontWeight: 600,
+  },
   linkBtn: {
     background: "transparent",
     border: "none",
@@ -199,7 +265,27 @@ const S: Record<string, React.CSSProperties> = {
     borderLeftColor: "transparent", // 实际颜色由行内 lv.color 覆盖
     borderRadius: 6,
     background: "var(--bg-surface)",
-    cursor: "default",
+    cursor: "pointer", // 点整条 = 标记已读（提示文案在 title 上）
+    transition: "background-color .12s, border-color .12s, opacity .12s",
+  },
+  // ⚠️ 这里**不能写 `borderColor`**。对象展开时已存在的键保持原位置 ——
+  // `borderLeftColor` 在 S.item 里先出现，位置就排在前面；再合并一个
+  // `borderColor` 简写会落在它之后，把它覆盖掉（等级色直接失效，左侧全变灰）。
+  // 所以只逐边设色，把左边让给行内的等级色。
+  /** 未读：轻微提亮的底 + 更实的边框，色条由行内等级色决定。 */
+  itemUnread: {
+    background: "var(--bg-hover)",
+    borderTopColor: "var(--border-medium)",
+    borderRightColor: "var(--border-medium)",
+    borderBottomColor: "var(--border-medium)",
+  },
+  /** 已读：整条降一档对比度 —— 底色回落、边框转浅，色条也转灰（行内覆盖）。 */
+  itemRead: {
+    background: "var(--bg-surface)",
+    borderTopColor: "var(--border-light)",
+    borderRightColor: "var(--border-light)",
+    borderBottomColor: "var(--border-light)",
+    opacity: 0.65,
   },
   itemHead: { display: "flex", alignItems: "center", gap: 8, marginBottom: 4 },
   badge: {
@@ -211,6 +297,15 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 3,
   },
   itemTitle: { flex: "1 1 auto", fontWeight: 600 },
+  itemTitleRead: { flex: "1 1 auto", fontWeight: 500, color: "var(--fg-secondary)" },
+  /** 未读圆点 —— 和标题字重一起构成「扫一眼就能看出哪些没看」的信号。 */
+  unreadDot: {
+    flex: "0 0 auto",
+    width: 6,
+    height: 6,
+    borderRadius: "50%",
+    background: "var(--accent)",
+  },
   time: { flex: "0 0 auto", fontSize: 11, color: "var(--fg-muted)" },
   body: {
     margin: "4px 0 0",

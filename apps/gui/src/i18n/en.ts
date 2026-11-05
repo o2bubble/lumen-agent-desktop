@@ -1494,6 +1494,8 @@ const en: Locale = {
     levelInfo: "Info",
     levelImportant: "Important",
     levelCritical: "Critical",
+    unread: "Unread",
+    clickToRead: "Click to mark as read",
   },
   update: {
     title: "Updates",

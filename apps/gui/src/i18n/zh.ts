@@ -1493,6 +1493,8 @@ const zh = {
     levelInfo: "通知",
     levelImportant: "重要",
     levelCritical: "紧急",
+    unread: "未读",
+    clickToRead: "点击标为已读",
   },
   update: {
     title: "更新",
