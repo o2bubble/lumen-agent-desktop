@@ -1,0 +1,5 @@
+name: "doc-metadata"
+author: "官方"
+version: "0.1.0"
+description: "AI 生成文档后自动抹除文件里的元信息（作者/公司/版本号/修订号/时间/缩略图），并回读验证。覆盖 Word / Excel / PPT / PDF / 图片"
+tags: ["metadata", "privacy", "office", "pdf", "exif", "plugin"]
