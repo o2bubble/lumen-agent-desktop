@@ -730,14 +730,13 @@ function CategoryContent({ cat, settings, update, applyServer, applyWorkspaceOnl
             {t("settings.aboutDescription")}
           </div>
 
-          {/* 源码仓库 —— gitee 是主仓库（日常 push 目标），github 是只读镜像
-              （github-clean 快照分支，见 scripts/sync-github-clean.sh）。 */}
+          {/* 只挂**本 GUI 仓库**（MIT）。CLI 引擎是独立项目、不在本仓，
+              这里也不做推广 —— 关于页讲的是这个桌面客户端。 */}
           <div style={{ marginTop: 20, width: "100%", maxWidth: 320 }}>
             <div style={{ fontSize: "calc(var(--font-scale, 1) * 11px)", color: "var(--fg-muted)", marginBottom: 6 }}>
               {t("settings.aboutRepos")}
             </div>
-            <RepoLink label={t("settings.aboutRepoGitee")} url="https://gitee.com/randomlife/claude-code-haha-dev" />
-            <RepoLink label={t("settings.aboutRepoGithub")} url="https://github.com/o2bubble/claude-code-haha-rush" />
+            <RepoLink label={t("settings.aboutRepoGitee")} url="https://gitee.com/randomlife/lumen-agent-desktop" />
           </div>
 
           {/* 设置项放在品牌信息之后 —— 关于页主体仍是"什么版本 / repo 在哪"，
