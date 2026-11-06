@@ -860,13 +860,26 @@ $pickPkgBtn.addEventListener("click", function () {
       $restoreBox.innerHTML = '<div class="citem-empty bad">插件进程未就绪</div>';
       return;
     }
+
+    // 超时保护（2026-11-06）。
+    //
+    // 之前没有超时：插件进程如果在解包中途卡住（大包 / 磁盘慢 / 进程假死），
+    // 面板就**一直停在"正在读取包…"** —— 用户看到的就是无限转圈，
+    // 既不知道是不是还在跑，也不知道该不该等。
+    //
+    // 60s 是宽松上限：真实备份几十 MB 也解完了，超过基本就是出事了。
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, 60000);
+
     fetch(API + "/api/inspect-package", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: p }),
+      signal: ctl.signal,
     })
       .then(function (r) { return r.json(); })
       .then(function (d) {
+        clearTimeout(timer);
         if (!d || !d.ok) {
           $restoreBox.innerHTML = '<div class="citem-empty bad">读不了这个包：' +
             escapeHtml((d && d.error) || "未知错误") + "</div>";
@@ -876,6 +889,14 @@ $pickPkgBtn.addEventListener("click", function () {
         renderRestore();
       })
       .catch(function (e) {
+        clearTimeout(timer);
+        if (e && e.name === "AbortError") {
+          $restoreBox.innerHTML = '<div class="citem-empty bad">' +
+            "读取超时（60 秒）。包可能太大、磁盘太慢，或插件进程卡住了。<br>" +
+            "可以重试一次；反复失败的话，直接在对话里告诉 AI 这个包的路径，" +
+            "让它用命令行检查。</div>";
+          return;
+        }
         $restoreBox.innerHTML = '<div class="citem-empty bad">读取失败：' +
           escapeHtml(e.message) + "</div>";
       });

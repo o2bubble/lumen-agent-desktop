@@ -354,11 +354,31 @@ async function extractArchive(gzPath, destDir) {
     return target;
   };
 
-  // ⚠️ **不能在 `gunzip.on("data", async ...)` 里 await 写文件**
-  // —— 事件回调不等待 Promise，`files++` 永远在解压结束后才执行
-  //（实测踩到：解出 0 个文件但 readEntry 却正常）。
-  // 正确做法：先把解压结果收集到数组，事件结束后统一落盘。
-  const toWrite = []; // { target, data } | { dir: target }
+  // ── 流式解包 ──
+  //
+  // 🔴 **不要攒进内存**（2026-11-06，实测 247MB 包卡 164 秒）：
+  //
+  // 真实备份里有个 130MB 的单文件（会话历史）。旧实现在每次 chunk 到达时
+  // 都 `Buffer.concat([pending, chunk])` —— pending 里那 130MB 被完整重拷一次，
+  // 45981 个 chunk 下来是 O(n²)：164 秒里 157 秒花在拷内存。
+  //
+  // 现在改成状态机：当前 entry 还没读完时，chunk 里的数据**直接 append 到磁盘**，
+  // 内存里只留解析头部需要的几百字节。
+  //
+  // ⚠️ 另一个坑：`gunzip.on("data", async ...)` 里 await 不生效 ——
+  // 事件回调不等 Promise，`files++` 会在解压结束后才执行（实测踩到：
+  // 解出 0 个文件但 readEntry 却正常）。所以这里用同步的 `writeSync`。
+  let curFd = null;      // 正在写的文件句柄
+  let curRemain = 0;     // 这个 entry 还剩多少字节没写
+  let curPadding = 0;    // 写完正文后还要跳过的对齐字节
+
+  const closeCur = () => {
+    if (curFd !== null) {
+      try { fs.closeSync(curFd); } catch { /* 已关 */ }
+      curFd = null;
+      files++;
+    }
+  };
 
   await new Promise((resolve, reject) => {
     const rs = fs.createReadStream(gzPath);
@@ -366,24 +386,54 @@ async function extractArchive(gzPath, destDir) {
 
     gunzip.on("data", (chunk) => {
       if (stopped) return;
-      pending = Buffer.concat([pending, chunk]);
 
       try {
-        while (pending.length >= BLOCK) {
-          const h = pending.subarray(0, BLOCK);
-          if (h.every((b) => b === 0)) { pending = Buffer.alloc(0); return; }
+        let buf = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+        let off = 0;
+
+        while (off < buf.length) {
+          // ① 正在写某个文件的正文 → 直接 append，不攒内存
+          if (curRemain > 0) {
+            const take = Math.min(curRemain, buf.length - off);
+            fs.writeSync(curFd, buf, off, take);
+            off += take;
+            curRemain -= take;
+            continue;
+          }
+
+          // ② 跳过正文之后的块对齐填充
+          if (curPadding > 0) {
+            const skip = Math.min(curPadding, buf.length - off);
+            off += skip;
+            curPadding -= skip;
+            if (curPadding === 0) closeCur();
+            continue;
+          }
+
+          // ③ 解析下一个头部
+          if (buf.length - off < BLOCK) break; // 头部不完整，等下一块
+          const h = buf.subarray(off, off + BLOCK);
+
+          if (h.every((b) => b === 0)) {
+            // 结尾的全零块
+            off = buf.length;
+            break;
+          }
 
           const nameRaw = h.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
           const prefix = h.subarray(345, 500).toString("utf8").replace(/\0.*$/, "");
           const sizeStr = h.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
           const size = parseInt(sizeStr || "0", 8) || 0;
           const type = String.fromCharCode(h[156]);
-          const total = BLOCK + size + padding(size);
-          if (pending.length < total) break;
+          off += BLOCK;
 
           if (type === "L") {
-            pendingLongName = pending.subarray(BLOCK, BLOCK + size).toString("utf8").replace(/\0+$/, "");
-            pending = pending.subarray(total);
+            // GNU 长文件名：这本身是个数据块
+            if (buf.length - off < size) {
+              throw new Error("长文件名块不完整（暂不支持跨块）");
+            }
+            pendingLongName = buf.subarray(off, off + size).toString("utf8").replace(/\0+$/, "");
+            off += size + padding(size);
             continue;
           }
 
@@ -392,51 +442,65 @@ async function extractArchive(gzPath, destDir) {
 
           if (type === "5") {
             const target = safeJoin(name);
-            if (target) toWrite.push({ dir: target });
+            if (target) { fs.mkdirSync(target, { recursive: true }); dirs++; }
+            off += padding(size);
           } else if (type === "0" || type === "\0") {
             const target = safeJoin(name);
             if (target) {
-              // 立刻拷贝一份（pending 后面会被切片复用）
-              toWrite.push({ target, data: Buffer.from(pending.subarray(BLOCK, BLOCK + size)) });
+              fs.mkdirSync(path.dirname(target), { recursive: true });
+              curFd = fs.openSync(target, "w");
+              curRemain = size;
+              curPadding = padding(size);
+              if (size === 0) { closeCur(); curPadding = 0; }
+            } else {
+              off += size + padding(size); // 不安全的路径 → 整块跳过
             }
+          } else {
+            // 其它类型（符号链接 / 设备文件等）→ 跳过正文
+            off += size + padding(size);
           }
-
-          pending = pending.subarray(total);
         }
+
+        // 剩下的尾巴留着跟下一块拼 —— 这时它最多几百字节（头部）
+        pending = off < buf.length ? Buffer.from(buf.subarray(off)) : Buffer.alloc(0);
       } catch (e) {
         stopped = true;
+        closeCur();
         gunzip.destroy();
         reject(e);
       }
     });
 
-    gunzip.on("error", (e) => { if (!stopped) { stopped = true; reject(e); } });
-    gunzip.on("end", () => { if (!stopped) { stopped = true; resolve(); } });
-    rs.on("error", (e) => { if (!stopped) { stopped = true; reject(e); } });
+    gunzip.on("error", (e) => { if (!stopped) { stopped = true; closeCur(); reject(e); } });
+    gunzip.on("end", () => { if (!stopped) { stopped = true; closeCur(); resolve(); } });
+    rs.on("error", (e) => { if (!stopped) { stopped = true; closeCur(); reject(e); } });
     rs.pipe(gunzip);
   });
-
-  // 统一落盘
-  for (const w of toWrite) {
-    if (w.dir) {
-      await fsp.mkdir(w.dir, { recursive: true });
-      dirs++;
-    } else {
-      await fsp.mkdir(path.dirname(w.target), { recursive: true });
-      await fsp.writeFile(w.target, w.data);
-      files++;
-    }
-  }
 
   return { files, dirs };
 }
 
-/** 读包内某个条目的内容（返回 string；找不到返回 null） */
+/**
+ * 读包内某个条目的内容（返回 string；找不到返回 null）。
+ *
+ * 🔴 **不要攒 pending**（2026-11-06，实测 247MB 包读 manifest.json 花 166 秒）：
+ * 旧写法每来一个 chunk 就 `Buffer.concat([pending, chunk])`，遇到包里那个
+ * 130MB 的单文件时，每块都把那 130MB 重拷一遍 → O(n²)。
+ *
+ * 现在跟 `extractArchive` 用同一套状态机：不关心的 entry 只推进偏移，
+ * 不复制数据；只有目标 entry 才把字节收集起来。
+ */
 async function readEntry(gzPath, entryName) {
   const want = entryName.replace(/\\/g, "/").replace(/^\.\/+/, "");
   let pending = Buffer.alloc(0);
   let pendingLongName = null;
   let found = null;
+
+  // 状态：正在跳过某个 entry 的正文时，还剩多少字节
+  let skipRemain = 0;
+  // 状态：目标 entry 的正文，已收集多少 / 总共多少
+  let wantChunks = null;
+  let wantRemain = 0;
 
   await new Promise((resolve, reject) => {
     const rs = fs.createReadStream(gzPath);
@@ -444,32 +508,66 @@ async function readEntry(gzPath, entryName) {
 
     gunzip.on("data", (chunk) => {
       if (found !== null) return;
-      pending = Buffer.concat([pending, chunk]);
-      while (pending.length >= BLOCK) {
-        const h = pending.subarray(0, BLOCK);
-        if (h.every((b) => b === 0)) { pending = Buffer.alloc(0); return; }
+
+      let buf = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      let off = 0;
+
+      while (off < buf.length) {
+        // ① 跳过不关心的 entry
+        if (skipRemain > 0) {
+          const take = Math.min(skipRemain, buf.length - off);
+          off += take;
+          skipRemain -= take;
+          continue;
+        }
+
+        // ② 收集目标 entry
+        if (wantChunks !== null) {
+          const take = Math.min(wantRemain, buf.length - off);
+          wantChunks.push(Buffer.from(buf.subarray(off, off + take)));
+          off += take;
+          wantRemain -= take;
+          if (wantRemain === 0) {
+            found = Buffer.concat(wantChunks).toString("utf8");
+            wantChunks = null;
+          }
+          continue;
+        }
+
+        // ③ 解析头部
+        if (buf.length - off < BLOCK) break;
+        const h = buf.subarray(off, off + BLOCK);
+        if (h.every((b) => b === 0)) { off = buf.length; break; }
+
         const nameRaw = h.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
         const prefix = h.subarray(345, 500).toString("utf8").replace(/\0.*$/, "");
         const sizeStr = h.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
         const size = parseInt(sizeStr || "0", 8) || 0;
         const type = String.fromCharCode(h[156]);
-        const total = BLOCK + size + padding(size);
-        if (pending.length < total) break;
+        off += BLOCK;
 
         if (type === "L") {
-          pendingLongName = pending.subarray(BLOCK, BLOCK + size).toString("utf8").replace(/\0+$/, "");
-        } else {
-          let name = prefix ? `${prefix}/${nameRaw}` : nameRaw;
-          if (pendingLongName) { name = pendingLongName; pendingLongName = null; }
-          const clean = name.replace(/^\.\/+/, "");
-          if (clean === want && (type === "0" || type === "\0")) {
-            found = pending.subarray(BLOCK, BLOCK + size).toString("utf8");
-            pending = Buffer.alloc(0);
-            return;
-          }
+          if (buf.length - off < size) throw new Error("长文件名块不完整（暂不支持跨块）");
+          pendingLongName = buf.subarray(off, off + size).toString("utf8").replace(/\0+$/, "");
+          off += size + padding(size);
+          continue;
         }
-        pending = pending.subarray(total);
+
+        let name = prefix ? `${prefix}/${nameRaw}` : nameRaw;
+        if (pendingLongName) { name = pendingLongName; pendingLongName = null; }
+        const clean = name.replace(/^\.\/+/, "");
+
+        if (clean === want && (type === "0" || type === "\0")) {
+          if (size === 0) { found = ""; off += padding(size); continue; }
+          wantChunks = [];
+          wantRemain = size;
+          // 不推进 off —— 上面的 ② 会从当前位置开始收集
+        } else {
+          skipRemain = size + padding(size);
+        }
       }
+
+      pending = off < buf.length ? Buffer.from(buf.subarray(off)) : Buffer.alloc(0);
     });
     gunzip.on("error", reject);
     gunzip.on("end", resolve);

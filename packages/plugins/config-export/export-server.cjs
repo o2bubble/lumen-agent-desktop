@@ -1528,9 +1528,86 @@ function buildImportGuide(manifest) {
  * `restore-tools.cjs` 早在 2026-10-26 就改成纯 Node 了（理由完全一样），
  * 但这个文件漏改。现在两边统一走 `tar-writer.cjs`，不再赌 PATH 里是哪个 tar。
  */
-async function extractPkg(pkgAbs, destDir) {
+async function extractPkg(pkgAbs, destDir, only) {
   await fsp.mkdir(destDir, { recursive: true });
-  return require("./tar-writer.cjs").extractArchive(path.resolve(pkgAbs), destDir);
+  const abs = path.resolve(pkgAbs);
+
+  // 优先用 Python 标准库 tarfile（2026-11-07）。
+  //
+  // 纯 Node 的自研解析在真实备份上要 180 秒：包里有个 130MB 单文件，
+  // 加上 29000 个文件的系统调用，Node 侧怎么优化都下不来。
+  // Python 的 tarfile 是 C 实现，同一个包 27 秒。
+  const py = findPython();
+  if (py) {
+    const r = runPythonExtract(py, abs, destDir, only);
+    if (r.ok) return r;
+    log(`Python 解包失败（${r.error}），回退纯 Node`);
+  }
+
+  // 回退：纯 Node。慢，但零外部依赖 —— Python 真的找不到时还能用。
+  return require("./tar-writer.cjs").extractArchive(abs, destDir);
+}
+
+/**
+ * 找可用的 Python。
+ *
+ * 顺序：环境里的 python → GUI 自带的组件。
+ * GUI 安装包会把 `python/` 前置进 PATH，但插件进程的 PATH 不一定继承到，
+ * 所以再按安装目录拼一遍兜底。
+ */
+let _pythonCache = null;
+function findPython() {
+  if (_pythonCache !== null) return _pythonCache;
+
+  const { execFileSync } = require("child_process");
+  const candidates = [];
+
+  // ① PATH 里的
+  if (process.platform === "win32") {
+    candidates.push("python", "py");
+  } else {
+    candidates.push("python3", "python");
+  }
+
+  // ② GUI 自带的（安装目录/python/python.exe 或 python/bin/python3）
+  const exeDir = path.dirname(process.execPath);
+  if (process.platform === "win32") {
+    candidates.push(path.join(exeDir, "python", "python.exe"));
+  } else {
+    candidates.push(path.join(exeDir, "python", "bin", "python3"));
+  }
+
+  for (const c of candidates) {
+    try {
+      execFileSync(c, ["--version"], { stdio: "pipe", timeout: 5000 });
+      log(`解包走 Python: ${c}`);
+      _pythonCache = c;
+      return c;
+    } catch { /* 试下一个 */ }
+  }
+
+  log("没找到 Python，解包回退纯 Node（大包会慢）");
+  _pythonCache = false;
+  return false;
+}
+
+function runPythonExtract(py, pkgAbs, destDir, only) {
+  const args = [path.join(__dirname, "extract.py"), pkgAbs, destDir];
+  if (only && only.length) args.push("--only", ...only);
+  try {
+    const out = execFileSync(py, args, {
+      encoding: "utf8",
+      timeout: 10 * 60 * 1000,
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const line = (out || "").trim().split("\n").pop() || "{}";
+    const r = JSON.parse(line);
+    return { ok: true, files: r.files || 0, dirs: r.dirs || 0 };
+  } catch (e) {
+    const stderr = e && e.stderr ? String(e.stderr).trim().slice(0, 200) : "";
+    return { ok: false, error: stderr || String((e && e.message) || e) };
+  }
 }
 
 /**
@@ -1547,7 +1624,14 @@ async function inspectPackage(pkgPath) {
 
   const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "cfg-inspect-"));
   try {
-    await extractPkg(pkgPath, tmp);
+    // 只看包信息，**不解全部**：真实备份 29000 个文件 / 657MB，全解要 30 秒；
+    // 只取这 4 个是 2 秒。用户点「选包」时等的是这个。
+    await extractPkg(pkgPath, tmp, [
+      "manifest.json",
+      "IMPORT_GUIDE.md",
+      "RESTORE_REHEARSAL.md",
+      "tools/restore-tools.cjs",
+    ]);
     const mfPath = path.join(tmp, "manifest.json");
     if (!fs.existsSync(mfPath)) {
       throw new Error("这个包里没有 manifest.json —— 可能不是本插件导出的备份");
