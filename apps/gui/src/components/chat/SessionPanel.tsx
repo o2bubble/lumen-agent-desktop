@@ -21,6 +21,7 @@ import {
   forkSession,
 } from "./useChatBridge";
 import { showCtxMenu, type ContextMenuItem } from "../ContextMenu";
+import { SessionMessageEditor } from "./SessionMessageEditor";
 import { t } from "../../i18n";
 import { addStatusMessage } from "../../stores/statusMsgStore";
 import { commandRegistry } from "../../services/windowBus";
@@ -205,6 +206,8 @@ function SessionPanelImpl() {
   // workspace (re)bind reloads them from the bound workspace's local file.
   useEvent<SettingsChangedPayload>(Events.SETTINGS_CHANGED);
   const [deleteTarget, setDeleteTarget] = useState<Session | null>(null);
+  /** 「编辑消息」弹窗的目标会话（null = 关闭） */
+  const [editTarget, setEditTarget] = useState<{ id: string; title: string } | null>(null);
   const [confirmOpenElsewhere, setConfirmOpenElsewhere] = useState<Session | null>(null);
   const [confirmBusySwitch, setConfirmBusySwitch] = useState<Session | null>(null);
   const [batchDeleteCount, setBatchDeleteCount] = useState(0);
@@ -533,6 +536,10 @@ function SessionPanelImpl() {
       });
     }
     items.push(
+      {
+        label: t("sessionEdit.entry"),
+        action: () => setEditTarget({ id: s.id, title: s.title }),
+      },
       {
         label: t("sessions.openInNewWindow"),
         action: () => void openInNewWindow(s.id),
@@ -873,6 +880,13 @@ function SessionPanelImpl() {
           title={deleteTarget.title}
           onConfirm={handleSingleDelete}
           onCancel={() => setDeleteTarget(null)}
+        />
+      )}
+      {editTarget && (
+        <SessionMessageEditor
+          sessionId={editTarget.id}
+          sessionTitle={editTarget.title}
+          onClose={() => setEditTarget(null)}
         />
       )}
       {batchDeleteCount > 0 && (

@@ -36,6 +36,7 @@ import {
 import { registerPluginInstallChatApi } from "../services/pluginInstallBridge";
 import { wsDiagAdd } from "../services/wsDiag";
 import { crossWindowBus } from "../services/crossWindowBus";
+import { forwardSessionEditMessage } from "../services/sessionEditBridge";
 import { chatReduce, isBackendBusy } from "./chatReduce";
 import { applyStoreEffects } from "./effects";
 import { CONTINUE_PROMPT } from "./sessionMerge";
@@ -727,6 +728,11 @@ export function createChatSession(): ChatSession {
       if (WS_VERBOSE) {
         console.log("[WS] onmessage:", e.data.substring(0, 200));
       }
+      // 会话消息编辑走独立通道（见 services/sessionEditBridge）——
+      // 在 dispatch **之前**转手，避免主 reducer 也认识这两个类型后重复处理。
+      try {
+        forwardSessionEditMessage(parsed as unknown as Record<string, unknown>);
+      } catch { /* 编辑面板不可用不该影响聊天 */ }
       try { dispatch(parsed); } catch (_) { console.error("[WS] dispatch error"); }
     };
     ws.onclose = (e) => {
