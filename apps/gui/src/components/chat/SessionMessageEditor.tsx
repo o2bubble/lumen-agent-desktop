@@ -221,7 +221,8 @@ export function SessionMessageEditor({ sessionId, sessionTitle, onClose }: Props
   );
 }
 
-const S: Record<string, React.CSSProperties> = {
+/** 导出仅供测试断言关键布局约束（见 sessionMessageEditorStyles.test.ts）。 */
+export const S: Record<string, React.CSSProperties> = {
   backdrop: {
     position: "fixed",
     inset: 0,
@@ -278,6 +279,10 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 8,
     background: "var(--bg-surface)",
     overflow: "hidden",
+    // 列表是 column flex 容器，子项默认 flex-shrink:1。轮数一多（真实会话
+    // 72 轮）就把每张卡压成 2px —— 界面上看起来就是一排横线。
+    // 必须在**主轴方向上禁止收缩**。
+    flexShrink: 0,
   },
   turnCardChecked: {
     borderColor: "var(--accent)",
