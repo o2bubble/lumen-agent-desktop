@@ -1514,30 +1514,23 @@ function buildImportGuide(manifest) {
 /**
  * 把包解到 destDir。
  *
- * ⚠️ **不能直接 `tar -C <绝对路径>`**（2026-10-25 实测，与打包同一个坑）：
- * `--force-local` 下 tar 会把 `C:` 当盘符语法转义成 `C\:\\...` → 路径不存在。
- * 解法：把包 copy 到目标目录，用**纯文件名**解（cwd = 目标目录）。
+ * 🔴 **纯 Node，不调系统 tar**（2026-11-06）。
+ *
+ * 之前用 `tar --force-local`，但 **Windows 自带的是 bsdtar**
+ * （`C:\Windows\System32\tar.exe`，3.8.x），它根本不认这个参数：
+ *
+ *     tar.exe: Option --force-local is not supported
+ *     Usage: List: tar.exe -tf <archive-filename> ...
+ *
+ * 结果是**恢复流程第一步就挂**，用户看到的就是这条报错。
+ * Git Bash 里的 `tar` 是 GNU tar，支持这个参数 —— 所以开发机上测不出来。
+ *
+ * `restore-tools.cjs` 早在 2026-10-26 就改成纯 Node 了（理由完全一样），
+ * 但这个文件漏改。现在两边统一走 `tar-writer.cjs`，不再赌 PATH 里是哪个 tar。
  */
 async function extractPkg(pkgAbs, destDir) {
   await fsp.mkdir(destDir, { recursive: true });
-  const resolved = path.resolve(pkgAbs);
-  const pkgDir = path.dirname(resolved);
-  const base = path.basename(resolved);
-
-  let tmpCopy = null;
-  let nameInDest = base;
-  if (path.resolve(pkgDir) !== path.resolve(destDir)) {
-    tmpCopy = path.join(destDir, `.tmp-${Date.now()}-${base}`);
-    await fsp.copyFile(resolved, tmpCopy);
-    nameInDest = path.basename(tmpCopy);
-  }
-  try {
-    execFileSync("tar", ["--force-local", "-xzf", nameInDest], {
-      cwd: destDir, timeout: 10 * 60 * 1000, stdio: "pipe",
-    });
-  } finally {
-    if (tmpCopy) await fsp.unlink(tmpCopy).catch(() => {});
-  }
+  return require("./tar-writer.cjs").extractArchive(path.resolve(pkgAbs), destDir);
 }
 
 /**

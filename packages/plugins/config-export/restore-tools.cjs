@@ -49,29 +49,16 @@ const fsp = require("fs/promises");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
-const { execFileSync } = require("child_process");
 
 // ══════════════════════════════════════════════════════════════
 // 基础
 // ══════════════════════════════════════════════════════════════
 
-/**
- * 跑 tar。
- *
- * ⚠️ **Windows 上 `-C` 与 `--force-local` 不能同时用绝对路径**（2026-10-25 实测）：
- *   · 不加 `--force-local` → GNU tar 把 `C:\...` 当远程主机名（`Cannot connect to C:`）
- *   · 加了 `--force-local` → 它又把 `C:` 当**盘符语法**转义成 `C\:\\...` → 路径不存在
- *
- * 解法：**切换到目标目录再执行**，让所有路径参数都变成相对名。
- * 这样两个坑都绕开。
- */
-function runTar(args, cwd) {
-  return execFileSync("tar", ["--force-local", ...args], {
-    encoding: "utf8",
-    cwd,
-    maxBuffer: 64 * 1024 * 1024,
-  });
-}
+// 这里曾经有个 `runTar()`，包一层 `tar --force-local`。
+// 已删除：Windows 自带的是 bsdtar，**不支持这个参数**
+//   tar.exe: Option --force-local is not supported
+// 而 Git Bash 里是 GNU tar、支持它 —— 于是开发机测着没问题，到用户机器上就挂。
+// 解包统一走 `tar-writer.cjs` 的纯 Node 实现，不再赌 PATH 里是哪个 tar。
 
 /**
  * 解包到 destDir。
