@@ -363,6 +363,18 @@ export function createChatSession(): ChatSession {
       case "plugin_refresh":
         msg.type = type;
         break;
+      // 会话消息编辑（见 components/chat/SessionMessageEditor）。
+      // ⚠️ 这两个**必须显式列出**：下面的 default 分支只写 type、把 payload
+      // 整个丢掉 —— 后端会收到没有 session_id 的消息，拼出 `undefined.jsonl`。
+      case "load_session_messages":
+        msg.type = type;
+        msg.session_id = p.session_id;
+        break;
+      case "delete_session_turns":
+        msg.type = type;
+        msg.session_id = p.session_id;
+        msg.turn_ids = p.turn_ids;
+        break;
       case "load_session":
       case "resume_session":
       case "delete_session":
@@ -407,6 +419,14 @@ export function createChatSession(): ChatSession {
         break;
       default:
         msg.type = type;
+        // 这里会**丢掉 payload**。曾经因为没有显式 case，session_id 没发出去，
+        // 后端拼出 `undefined.jsonl`（2026-11-06 用户实测）。新加消息类型时
+        // 忘了补 case 是很自然的疏忽 —— 与其静默丢弃，不如喊一声。
+        if (Object.keys(p).length > 0) {
+          console.warn(
+            `[WS] send("${type}") 带了 payload 但 switch 里没有对应 case，payload 会被丢弃`,
+          );
+        }
     }
     const json = JSON.stringify(msg);
     if (ws && ws.readyState === WebSocket.OPEN) {

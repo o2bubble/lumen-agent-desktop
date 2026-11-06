@@ -64,6 +64,11 @@ export function SessionMessageEditor({ sessionId, sessionTitle, onClose }: Props
     setSelected(new Set());
     setExpanded(new Set());
     setError(null);
+    // 空 id 直接报错、不发请求 —— 否则后端拿 undefined 拼出 `undefined.jsonl`
+    if (!sessionId) {
+      setError(t("sessionEdit.loadFailed"));
+      return;
+    }
     try {
       send("load_session_messages", { session_id: sessionId });
     } catch {
@@ -99,7 +104,7 @@ export function SessionMessageEditor({ sessionId, sessionTitle, onClose }: Props
   }, []);
 
   const doDelete = useCallback(async () => {
-    if (selected.size === 0 || busy) return;
+    if (selected.size === 0 || busy || !sessionId) return;
     const ok = window.confirm(
       t("sessionEdit.confirm", {
         n: String(selected.size),

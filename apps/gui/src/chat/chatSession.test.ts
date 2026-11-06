@@ -577,3 +577,35 @@ describe("ChatSession — 自动续跑被中断的回合", () => {
     expect(count()).toBe(1);
   });
 });
+
+// ── 会话消息编辑（2026-11-06 线上事故回归）──
+//
+// send() 内部是**按类型 switch** 的白名单，default 分支只写 type、丢弃 payload。
+// 新加 load_session_messages 时忘了补 case，后端收到没有 session_id 的消息，
+// 去读 `undefined.jsonl` → 用户看到「Failed to load session messages: ENOENT」。
+describe("ChatSession — 会话消息编辑的消息必须带上 payload", () => {
+  function openAndGetWs() {
+    const s = createChatSession();
+    s.connect(8002);
+    const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    ws._open();
+    return { s, ws };
+  }
+
+  it("load_session_messages 带上 session_id", () => {
+    const { s, ws } = openAndGetWs();
+    s.send("load_session_messages", { session_id: "sess-123" });
+    const sent = ws.sent.map((d) => JSON.parse(d)).filter((m) => m.type === "load_session_messages");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].session_id).toBe("sess-123");
+  });
+
+  it("delete_session_turns 带上 session_id 与 turn_ids", () => {
+    const { s, ws } = openAndGetWs();
+    s.send("delete_session_turns", { session_id: "sess-123", turn_ids: ["u1", "u2"] });
+    const sent = ws.sent.map((d) => JSON.parse(d)).filter((m) => m.type === "delete_session_turns");
+    expect(sent).toHaveLength(1);
+    expect(sent[0].session_id).toBe("sess-123");
+    expect(sent[0].turn_ids).toEqual(["u1", "u2"]);
+  });
+});
