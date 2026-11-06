@@ -158,11 +158,16 @@ export function AnnouncementPanel() {
               title={read ? undefined : t("announcement.clickToRead")}
             >
               <div style={S.itemHead}>
+                {/* 徽章始终按等级着色，**不随已读转灰** —— 它表达的是「这条有多要紧」，
+                    和「我读没读」是两件事。已读状态已经由卡片透明度、左侧色条、
+                    圆点缺失、标题字重四重表达过了，不必让徽章再重复一次。 */}
                 <span
                   style={{
                     ...S.badge,
-                    color: read ? "var(--fg-muted)" : lv.color,
-                    borderColor: read ? "var(--border-medium)" : lv.color,
+                    color: lv.color,
+                    borderColor: lv.color,
+                    // 已读时略微降低存在感，但保住色相 —— 扫一眼仍分得出红/橙/灰
+                    opacity: read ? 0.7 : 1,
                   }}
                 >
                   {lv.label()}
