@@ -841,6 +841,7 @@ pub fn run() {
             read_file,
             search_in_files,
             read_bytes,
+            resolve_open_path,
             file_signatures,
             list_plugin_manifests,
             plugin_autoupdate_lock,
@@ -1212,7 +1213,9 @@ fn read_file(path: String) -> Result<String, String> {
     // read_to_string 会按**进程 cwd** 解析 → 必然失败 → 调用方回退到资源管理器，
     // 表现为"点了 chip 却在资源管理器打开"。
     let work_dir = crate::settings::load_settings().work_dir;
-    let abs = resolve_explorer_path(&path, &work_dir);
+    // 工作区内找不到时向上回溯（AI 可能按仓库根给相对路径 —— 见 resolve_existing_path）
+    let abs = resolve_existing_path(&path, &work_dir)
+        .unwrap_or_else(|| resolve_explorer_path(&path, &work_dir));
     log::info!("read_file: {} (resolved: {})", path, abs);
     std::fs::read_to_string(&abs).map_err(|e| format!("Cannot read file: {}", e))
 }
@@ -1245,7 +1248,10 @@ fn file_signatures(paths: Vec<String>) -> Vec<FileSignature> {
     paths
         .into_iter()
         .map(|path| {
-            let abs = resolve_explorer_path(&path, &work_dir);
+            // 与 read_file / read_bytes 用同一套解析，否则按祖先打开的文件
+            // 会被判成"已不存在"（外部改动检测误报）
+            let abs = resolve_existing_path(&path, &work_dir)
+                .unwrap_or_else(|| resolve_explorer_path(&path, &work_dir));
             match std::fs::metadata(&abs) {
                 Ok(md) => {
                     let mtime = md
@@ -1279,7 +1285,8 @@ fn read_bytes(path: String) -> Result<String, String> {
     // 相对路径同样以工作区为基准解析（同 read_file）——图片预览/ImageItem 的路径
     // 可能来自 @ref chip，直接按进程 cwd 解析会 File not found。
     let work_dir = crate::settings::load_settings().work_dir;
-    let abs = resolve_explorer_path(&path, &work_dir);
+    let abs = resolve_existing_path(&path, &work_dir)
+        .unwrap_or_else(|| resolve_explorer_path(&path, &work_dir));
     log::info!("read_bytes: {} (resolved: {})", path, abs);
     let p = std::path::PathBuf::from(&abs);
     if !p.exists() {
@@ -1720,12 +1727,24 @@ fn create_path(path: String, is_dir: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// 把「要打开的路径」解析成**实际存在的绝对路径**；找不到返回 None。
+///
+/// 前端在打开前调它，之后 tab / 保存 / 签名全部使用这个绝对路径。
+/// 这一点是必需的：如果只让 read_file 内部回退、tab 仍存原始相对路径，
+/// 那么「按祖先打开成功 → 编辑 → 保存」会写到工作区下的错误位置
+/// （save_file 不解析，原样写）。
+#[tauri::command]
+fn resolve_open_path(path: String) -> Option<String> {
+    let work_dir = crate::settings::load_settings().work_dir;
+    resolve_existing_path(&path, &work_dir)
+}
+
 #[tauri::command]
 fn path_exists(path: String) -> bool {
     // 相对路径同样以工作区为基准（同 read_file/read_bytes）：粘贴判断"这段文本是不是
     // 文件路径"时，用户复制的可能是工作区内的相对路径，按 cwd 解析会误判为不存在。
     let work_dir = crate::settings::load_settings().work_dir;
-    std::path::PathBuf::from(resolve_explorer_path(&path, &work_dir)).exists()
+    resolve_existing_path(&path, &work_dir).is_some()
 }
 
 #[tauri::command]
@@ -5059,6 +5078,42 @@ fn read_clipboard_files() -> Result<Vec<String>, String> {
 
 // ── File tree context menu helpers ──
 
+/// 向上回退的层数上限。monorepo 里工作区常在仓库下 2~3 层，
+/// 4 层足够覆盖；再多就是乱猜了（每层只是一次 stat，成本可忽略）。
+const ANCESTOR_FALLBACK_MAX: usize = 4;
+
+/// 解析**应当已存在**的文件路径 —— 按工作区找不到时，沿祖先目录再找。
+///
+/// 为什么需要：工作区可能只是仓库的一个子目录（`repo/cloud-ui`），而 AI 有时
+/// 按**仓库根**给相对路径（`cloud-ui/src/a.js`）。按工作区拼会多一层，
+/// 交付卡片点了永远打不开。
+///
+/// 只用于「打开/读取」——**不要用在写入路径上**：写操作必须落在工作区内，
+/// 向上回退会把新文件写到工作区外面去。
+///
+/// 返回 `None` 表示哪里都找不到，调用方可用原解析结果去报错。
+fn resolve_existing_path(raw: &str, work_dir: &str) -> Option<String> {
+    let direct = resolve_explorer_path(raw, work_dir);
+    if std::path::Path::new(&direct).exists() {
+        return Some(direct);
+    }
+    // 绝对路径不向上找 —— 指哪打哪，找不到就是真没有
+    if std::path::Path::new(raw).is_absolute() {
+        return None;
+    }
+    let mut base = std::path::PathBuf::from(work_dir);
+    for _ in 0..ANCESTOR_FALLBACK_MAX {
+        if !base.pop() {
+            break;
+        }
+        let cand = resolve_explorer_path(raw, &base.to_string_lossy());
+        if std::path::Path::new(&cand).exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
 /// 把划词文本里的路径解析成绝对路径（纯函数，可单测）。
 /// 相对路径以工作区根为基准拼接——划词文本常含项目内相对路径
 /// （如 `src/utils/pathDetector.ts`），若原样传给 explorer，它会在
@@ -5094,7 +5149,9 @@ fn open_in_explorer(path: String) -> Result<(), String> {
 
     // explorer 要求 /select, 与路径合成单个参数：分离传参时 explorer 会忽略
     // 选择指令，退化为打开默认「文档」库（实测分离参数打开了文档而非目标目录）。
-    let abs = resolve_explorer_path(&path, &crate::settings::load_settings().work_dir);
+    let work_dir = crate::settings::load_settings().work_dir;
+    let abs = resolve_existing_path(&path, &work_dir)
+        .unwrap_or_else(|| resolve_explorer_path(&path, &work_dir));
     // 先确认路径真实存在——不存在时打开资源管理器只会退化为「文档」库或空窗口
     if !std::path::Path::new(&abs).exists() {
         return Err(format!("Path not found: {}", abs));
@@ -7231,6 +7288,40 @@ mod tests {
         // 盘符根例外：去掉尾部只剩 `C:`，保留反斜杠又会拼出 `\"`；
         // 这种路径无空格，不加引号即可。
         assert_eq!(explorer_select_arg(r"C:\"), r"/select,C:\");
+    }
+
+    /// 工作区是仓库子目录、AI 按**仓库根**给相对路径时，必须能找回来。
+    ///
+    /// 用户实际场景（2026-11-06）：工作区 `C:\Storage\work\EL_Ruoyi\cloud-ui`，
+    /// 仓库根在上一层，AI 交付 `cloud-ui/src/a.js` —— 按工作区拼会变成
+    /// `...\cloud-ui\cloud-ui\src\a.js`，怎么点都打不开。
+    #[test]
+    fn resolve_existing_path_falls_back_to_ancestor() {
+        let tmp = std::env::temp_dir().join(format!("resolve_fallback_{}", std::process::id()));
+        let repo = tmp.join("repo");
+        let ws = repo.join("sub");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(repo.join("a.txt"), b"x").unwrap();
+        std::fs::write(ws.join("b.txt"), b"y").unwrap();
+
+        let ws_s = ws.to_string_lossy().to_string();
+
+        // ① 工作区内找得到 → 用工作区的
+        let hit = resolve_existing_path("b.txt", &ws_s).unwrap();
+        assert_eq!(std::path::Path::new(&hit), ws.join("b.txt"));
+
+        // ② 工作区内找不到、祖先里有 → 用祖先的（仓库根基准）
+        let hit = resolve_existing_path("sub/b.txt", &ws_s).unwrap();
+        assert_eq!(std::path::Path::new(&hit), ws.join("b.txt"));
+
+        // ③ 哪都没有 → None
+        assert!(resolve_existing_path("nope.txt", &ws_s).is_none());
+
+        // ④ 绝对路径不向上找（不存在就是不存在）
+        let missing = tmp.join("missing.txt").to_string_lossy().to_string();
+        assert!(resolve_existing_path(&missing, &ws_s).is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

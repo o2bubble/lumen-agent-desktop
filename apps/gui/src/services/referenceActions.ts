@@ -6,6 +6,23 @@ import { addStatusMessage } from "../stores/statusMsgStore";
 import { fileService } from "./fileService";
 
 /**
+ * 把相对路径解析成实际存在的绝对路径；解析不到就原样返回。
+ *
+ * 后端 `resolve_open_path` 会先按工作区拼，找不到再沿祖先目录找
+ * （AI 有时按仓库根给相对路径，而工作区可能只是仓库的子目录）。
+ * 非 Tauri 环境（浏览器内跑组件）没有后端，直接用原值。
+ */
+async function resolveOpenPath(path: string): Promise<string> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const resolved = await invoke<string | null>("resolve_open_path", { path });
+    return resolved ?? path;
+  } catch {
+    return path;
+  }
+}
+
+/**
  * 在编辑器里打开一个路径 —— **全应用唯一的入口**，按类型分流：
  * - 图片 / PDF（`isPreviewable`）→ `openPreview`（由 FilePreview 用 read_bytes 加载）
  * - 其它（文本）→ 读内容后 `openFile`
@@ -17,11 +34,16 @@ import { fileService } from "./fileService";
  *
  * @returns 是否成功打开（回退到资源管理器也算成功）
  */
-export async function openPathInEditor(path: string, opts?: {
+export async function openPathInEditor(originalPath: string, opts?: {
   /** 需要额外提示的使用场景（默认静默成功 —— 打开本身已是反馈） */
   silent?: boolean;
 }): Promise<boolean> {
-  if (!path) return false;
+  if (!originalPath) return false;
+  // 先解析成**实际存在的绝对路径**再打开，后续 tab/保存/签名全用这个。
+  // 为什么要在这一层做：AI 给的相对路径未必以工作区为基准（工作区可能只是
+  // 仓库的子目录），Rust 侧会沿祖先目录找回。但若 tab 仍存原始相对路径，
+  // 「打开成功 → 编辑 → 保存」会写到工作区下的错误位置（save_file 不解析）。
+  const path = await resolveOpenPath(originalPath);
   const name = path.split(/[/\\]/).pop() || path;
   if (isPreviewable(path)) {
     editorStore.openPreview(path, name);
