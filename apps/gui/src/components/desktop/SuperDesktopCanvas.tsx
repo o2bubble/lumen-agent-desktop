@@ -18,6 +18,7 @@ import { createFloatingFromTab, createTauriWindowFromTab } from "../../stores/la
 import { t } from "../../i18n";
 import { findSnapAnchor } from "./snapAnchor";
 import { decideWheelRoute, type ScrollableBox } from "./wheelRouting";
+import { isTextEditingTarget } from "./editableTarget";
 
 const CANVAS_CONTAINER = {
   flex: 1,
@@ -528,9 +529,8 @@ function SuperDesktopCanvasImpl({ desktop, searchMatchedIds }: Props) {
 
   const handlePaste = useCallback(
     async (e: React.ClipboardEvent) => {
-      // Don't intercept paste inside editable elements (inputs, textareas, contentEditable)
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
+      // 编辑中的粘贴归编辑器自己处理（输入框、contentEditable 及其内部元素）
+      if (isTextEditingTarget(e.target)) return;
       e.preventDefault();
 
       const pos = getViewportCenter();
@@ -652,7 +652,7 @@ function SuperDesktopCanvasImpl({ desktop, searchMatchedIds }: Props) {
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     // Delete → delete all selected items
     if ((e.key === "Delete" || e.key === "Backspace") && selectedIds.size > 0) {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (isTextEditingTarget(e.target)) return;
       pushHistory(desktop.id);
       for (const id of selectedIds) {
         removeItem(id);
