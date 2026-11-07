@@ -88,3 +88,9 @@ node_modules/
 # 环境
 .env
 .env.*
+
+# 插件签名产物 —— 描述的是某个具体 zip 的字节序列，不是源文件。
+# 有私钥随时能重算（scripts/sign-plugin.py），入库只会每次都变、制造噪音。
+# ⚠️ 但**发布时绝不能省**：无签名的包在市场上是 signed=false，
+# 用户拿不到「安装」按钮（2026-11-07 事故）。签名由 pack-plugins.py 自动完成。
+packages/plugins/*/*.sig
