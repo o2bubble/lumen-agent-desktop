@@ -225,3 +225,46 @@ test("打包不依赖 PATH 里的 tar（纯 Node）", async () => {
 function readFileSyncSafe(p) {
   return fs.readFileSync(p, "utf8");
 }
+
+// ── 2026-11-07：manifest 必须排在包开头 ──
+//
+// 根因：tar.gz 是顺序流，读第 N 条要先把前面全解压一遍。
+// manifest 曾经排在 data/ 之后（归档最后一条）→ list/compare/rate
+// 每次都要白解整个包（651MB 实测 3 分 17 秒）。
+test("packDirectory({first}) 把指定条目排到最前面", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tw-first-"));
+  const src = path.join(tmp, "src");
+  const w = (p, c) => {
+    fs.mkdirSync(path.dirname(path.join(src, p)), { recursive: true });
+    fs.writeFileSync(path.join(src, p), c);
+  };
+  w("aaa.txt", "A");
+  w("data/bbb.txt", "B");
+  w("manifest.json", "{}");
+  w("zzz.txt", "Z");
+
+  const gz = path.join(tmp, "p.tar.gz");
+  await packDirectory(src, gz, { first: ["manifest.json"] });
+
+  const names = await listArchive(gz);
+  const idx = names.findIndex((n) => n.endsWith("manifest.json"));
+  assert.strictEqual(idx, 0, `manifest 应在最前，实际位置 ${idx}: ${names.join(",")}`);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("packDirectory 不给 first 时保持原顺序（向后兼容）", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tw-nofirst-"));
+  const src = path.join(tmp, "src");
+  fs.mkdirSync(src, { recursive: true });
+  fs.writeFileSync(path.join(src, "a.txt"), "A");
+  fs.writeFileSync(path.join(src, "z.txt"), "Z");
+
+  const gz = path.join(tmp, "p.tar.gz");
+  await packDirectory(src, gz);
+  const names = await listArchive(gz);
+  assert.ok(names.findIndex((n) => n.endsWith("a.txt")) <
+            names.findIndex((n) => n.endsWith("z.txt")));
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});

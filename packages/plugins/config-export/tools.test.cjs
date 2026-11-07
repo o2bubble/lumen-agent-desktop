@@ -257,3 +257,54 @@ test("未知命令 → 报错而不是静默", () => {
   assert.strictEqual(r.ok, false);
   assert.ok(r.error.includes("未知命令"));
 });
+
+// ── 2026-11-07：路径重映射 / 子集提取 / 流式校验 ──
+
+test("--only: 只解压匹配的条目，其余跳过", () => {
+  const dest = path.join(HOME, "only-dest");
+  const r = run(["extract", PKG, "--dest", dest, "--only", "^(claude/settings\.json$)"]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.filtered, "^(claude/settings\.json$)");
+  assert.strictEqual(r.files, 1, "只应有 1 个文件落盘");
+  assert.ok(r.skipped > 0, "其余条目应记为 skipped");
+  assert.ok(fs.existsSync(path.join(dest, "data/claude/settings.json")));
+  assert.ok(!fs.existsSync(path.join(dest, "data/claude/CLAUDE.md")), "不该解出未匹配的文件");
+});
+
+test("verify: 流式校验不落盘（不产生解包目录）", () => {
+  const before = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("rt-verify-")).length;
+  const r = run(["verify", PKG]);
+  const after = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith("rt-verify-")).length;
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(after, before, "verify 不应再建临时解包目录");
+});
+
+test("--map: 把 ~ 映射到别处后，目标判定跟着走", () => {
+  const fakeHome = path.join(HOME, "other-home");
+  fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+  fs.copyFileSync(path.join(CLAUDE, "CLAUDE.md"), path.join(fakeHome, ".claude", "CLAUDE.md"));
+
+  const r = run(["compare", PKG, "--dest", path.join(HOME, "nope"), "--map", `~=${fakeHome}`]);
+  assert.strictEqual(r.ok, true);
+  assert.ok(r.summary.identical >= 1 || r.summary.exists >= 1,
+    `映射后应能在这份家目录里找到文件，实际 ${JSON.stringify(r.summary)}`);
+});
+
+test("resolveTarget: ~/.skills 支持单独映射（不被 ~ 吃掉）", () => {
+  const { resolveTarget } = require("./restore-tools.cjs");
+  const map = { "~": "/home/u", "~/.skills": "/home/u/.claude/skills" };
+  assert.strictEqual(
+    resolveTarget("~/.skills/foo/SKILL.md", "/x", map).replace(/\\/g, "/"),
+    "/home/u/.claude/skills/foo/SKILL.md",
+  );
+  assert.strictEqual(
+    resolveTarget("~/.claude/settings.json", "/x", map).replace(/\\/g, "/"),
+    "/home/u/.claude/settings.json",
+  );
+});
+
+test("resolveTarget: 未映射 ~/.skills 不报 unresolvable", () => {
+  const { resolveTarget } = require("./restore-tools.cjs");
+  const got = resolveTarget("~/.skills/a/SKILL.md", "/root");
+  assert.ok(got && got.replace(/\\/g, "/").endsWith("/root/.skills/a/SKILL.md"));
+});

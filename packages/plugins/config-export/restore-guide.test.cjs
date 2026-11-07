@@ -134,3 +134,51 @@ test("没有会话分类时不出现会话合并章节（避免噪音）", async
   const g = guideOf(out);
   assert.ok(!g.includes("冲突怎么合并"), "没导会话就不该有这章");
 });
+
+// ── 2026-11-07：措辞降硬 + 工具说明不能缺席 + 收尾清理 ──
+
+test("文档是参考不是教条：明确说 AI 可按实际情况调整", async () => {
+  const out = path.join(HOME, "j.tar.gz");
+  await m.doExport({ categories: ["claude-md"], outputPath: out });
+  const g = guideOf(out);
+
+  assert.ok(g.includes("都是**参考**"), "必须说明文档与脚本是参考实现");
+  assert.ok(g.includes("你的判断优先于本文档"), "必须把判断权交给恢复端 AI");
+  assert.ok(/restore\.target.*本身就是错的/.test(g), "要允许推翻清单里的错误目标");
+  assert.ok(g.includes("唯一的硬要求"), "要划出唯一的硬边界（破坏性操作先备份先问）");
+});
+
+test("没有自定义项时，工具说明和恢复率口径仍然出现", async () => {
+  const out = path.join(HOME, "k.tar.gz");
+  await m.doExport({ categories: ["claude-md"], outputPath: out });
+  const g = guideOf(out);
+
+  assert.ok(!g.includes("自定义项："), "这个包里没有自定义项");
+  assert.ok(g.includes("包内自带工具"), "工具说明必须无条件出现");
+  assert.ok(g.includes("自动验证通过率"), "恢复率口径必须无条件出现");
+  assert.ok(g.includes("第 3 步：验证与报告"), "验证步骤必须无条件出现");
+});
+
+test("提示命令耗时与路径映射陷阱", async () => {
+  const out = path.join(HOME, "l.tar.gz");
+  await m.doExport({ categories: ["claude-md"], outputPath: out });
+  const g = guideOf(out);
+
+  assert.ok(g.includes("哪些命令慢"), "要提示耗时");
+  assert.ok(g.includes("tar.gz 顺序流"), "要解释为什么慢");
+  assert.ok(g.includes("别继续等"), "要教 AI 别干等");
+  assert.ok(g.includes("旧版脚本"), "要点明分钟级通常是 bug 而非包大");
+  assert.ok(g.includes("不要**用 `sleep`"), "禁止 sleep 轮询卡住的任务");
+  assert.ok(g.includes("导出机 ≠ 这台机器"), "要点明路径未必匹配");
+  assert.ok(g.includes("--map"), "要给出重映射手段");
+  assert.ok(g.includes("别急着说「恢复失败」"), "路径对不上不等于恢复失败");
+});
+
+test("收尾要问用户是否清理临时文件", async () => {
+  const out = path.join(HOME, "m.tar.gz");
+  await m.doExport({ categories: ["claude-md"], outputPath: out });
+  const g = guideOf(out);
+
+  assert.ok(g.includes("要不要清理临时文件"), "必须提醒询问清理");
+  assert.ok(g.includes("备份副本不要和临时文件一起删"), "备份副本不能和临时文件混为一谈");
+});
