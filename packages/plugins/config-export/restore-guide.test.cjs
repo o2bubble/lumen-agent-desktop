@@ -182,3 +182,35 @@ test("收尾要问用户是否清理临时文件", async () => {
   assert.ok(g.includes("要不要清理临时文件"), "必须提醒询问清理");
   assert.ok(g.includes("备份副本不要和临时文件一起删"), "备份副本不能和临时文件混为一谈");
 });
+
+// ── 2026-11-07：快捷提示不能只活在返回值里 ──
+//
+// 事故：恢复用的提示词曾经只存在于 doExport() 的返回值中 —— 面板不显示、
+// 包内文件不记录。用户换机器时想不起那句话放在哪，只能凭印象重述
+// （"按流程走、别跳过"），指令就走了样，恢复行为随之跑偏。
+test("快捷提示写进了指南、manifest 和返回值三处", async () => {
+  const out = path.join(HOME, "n.tar.gz");
+  const r = await m.doExport({ categories: ["claude-md"], outputPath: out });
+
+  // ① 返回值（面板用）
+  assert.ok(r.recommendedImportPrompt, "返回值里要有");
+  assert.ok(r.recommendedImportPrompt.includes("IMPORT_GUIDE.md"));
+
+  // ② 包内指南（用户解开包就能看到）
+  const g = guideOf(out);
+  assert.ok(g.includes("恢复用的快捷提示"), "指南里要有专节");
+  assert.ok(g.includes("贴进输入框"), "要说明怎么用");
+  assert.ok(g.includes(path.basename(out)), "提示里要带真实包名");
+
+  // ③ manifest（脚本/AI 可直接读）
+  const mfRaw = execFileSync("tar", ["--force-local", "-xzf", out, "-O", "./manifest.json"], { encoding: "utf8" });
+  const mf = JSON.parse(mfRaw);
+  assert.ok(mf.restorePrompt && mf.restorePrompt.includes("IMPORT_GUIDE.md"), "manifest 里要有");
+});
+
+test("恢复完要提醒用户把快捷提示存起来", async () => {
+  const out = path.join(HOME, "o.tar.gz");
+  await m.doExport({ categories: ["claude-md"], outputPath: out });
+  const g = guideOf(out);
+  assert.ok(g.includes("提醒用户把这段存起来"), "要提醒留存，否则下次换机又找不到");
+});
