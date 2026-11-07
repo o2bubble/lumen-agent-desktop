@@ -53,12 +53,16 @@ test("zip 与源码逐字节一致（漏打包 = 发出去的还是旧代码）"
   const names = zipList();
   assert.ok(names.length > 0, "读不出 zip 内容");
 
+  // zip 里的文本是 **LF 归一化**过的（pack-plugins.py 有意为之：Windows 工作树
+  // 是 CRLF，原样打包会让每次重新打包产生一堆二进制 diff）。比较时两边都归一化，
+  // 否则这条测试会因为换行符永远红。
+  const norm = (s) => s.replace(/\r\n/g, "\n");
   const stale = [];
   for (const f of SHIPPED) {
     if (!names.includes(f)) { stale.push(`${f}（zip 里没有）`); continue; }
     const inZip = execFileSync("unzip", ["-p", ZIP, f], { encoding: "utf8" });
     const onDisk = fs.readFileSync(path.join(DIR, f), "utf8");
-    if (inZip !== onDisk) stale.push(`${f}（内容不一致）`);
+    if (norm(inZip) !== norm(onDisk)) stale.push(`${f}（内容不一致）`);
   }
   assert.deepStrictEqual(stale, [],
     `这些文件和源码不一致，请重新打包 config-export.zip：\n  ${stale.join("\n  ")}`);
