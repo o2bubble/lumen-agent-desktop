@@ -20,6 +20,20 @@
 //   session-merge <base> <other> -o <out>   按 uuid 合并两个会话（自动备份原文件）
 //   json-merge  <base.json> <other.json>    预览两个 JSON 的按键合并结果（不写盘）
 //   extract     <pkg> --dest <dir>          解包到目标目录
+//               [--only <正则>]             只解压匹配的条目（跳过其余，省下大部分 I/O）
+//
+// compare / rate / verify 都接受 `--map`：
+//   --map "~=C:/Users/me,%APPDATA%=C:/Users/me/AppData/Roaming,<workspace>=D:/proj,.skills=C:/Users/me/.claude/skills"
+// 用来处理「导出机的路径在导入机上不存在」——不映射的话这些条目只会报 unresolvable / missing。
+//
+// ## ⚠️ 这些是**参考实现**，不是必须照抄的教条
+//
+// 脚本把常见套路固化下来，省得每个 AI 各写一版、各错各的。
+// 但它**不知道**这台机器的实际情况 —— 遇到下面这些情况，**改脚本/绕开它都行**：
+//   · 目标机的目录布局和这里假设的不一样（技能根在别处、APPDATA 被重定向）
+//   · 需要按内容合并（脚本只做按键/按 uuid 的机械合并）
+//   · 包内清单本身就是错的（路径写错、分类放错）—— 以**用户的实际环境**为准
+// 改动后记得把「为什么改」告诉用户，别默默偏离。
 //
 // ## 恢复率怎么算（**这是本文件最重要的约定**）
 //
@@ -72,8 +86,8 @@ const crypto = require("crypto");
  *
  * `tar-writer.cjs` 随包分发（`tools/tar-writer.cjs`），纯 Node 实现。
  */
-async function extractTo(pkgAbs, destDir) {
-  return require("./tar-writer.cjs").extractArchive(pkgAbs, destDir);
+async function extractTo(pkgAbs, destDir, onlyRe) {
+  return require("./tar-writer.cjs").extractArchive(pkgAbs, destDir, onlyRe);
 }
 
 /** 报错并退出。**也写 stdout** —— 调用方（AI / 脚本）通常只解析 stdout，
@@ -125,9 +139,19 @@ function posArgs(argv) {
   return out;
 }
 
-function sha256File(p) {
+/**
+ * 流式 sha256。
+ *
+ * 🔴 原来用 `readFileSync`（2026-11-07 改）：会话文件动辄 100+ MB，
+ * `rate`/`compare` 要对成千上万个文件算哈希，同步整读既慢又可能把内存打爆。
+ */
+async function sha256File(p) {
+  const h = crypto.createHash("sha256");
   try {
-    return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
+    for await (const chunk of fs.createReadStream(p, { highWaterMark: 1024 * 1024 })) {
+      h.update(chunk);
+    }
+    return h.digest("hex");
   } catch {
     return null;
   }
@@ -268,80 +292,122 @@ async function cmdVerify(argv) {
   if (!pkg) die("用法：verify <包路径> [--dest <已恢复目录>]");
   const mf = await readManifest(pkg);
 
-  // 解到临时目录校验（不碰 dest）
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "rt-verify-"));
-  try {
-    await extractTo(path.resolve(pkg), tmp);
-
-    const results = [];
-    for (const it of mf.items || []) {
-      const inPkg = path.join(tmp, "data", it.relPath);
-      const exists = fs.existsSync(inPkg);
-      const actual = exists ? sha256File(inPkg) : null;
-      const ok = exists && (!it.sha256 || actual === it.sha256);
-      results.push({
-        relPath: it.relPath,
-        category: it.category,
-        mode: it.restore && it.restore.mode,
-        target: it.restore && it.restore.target,
-        packageSha: it.sha256,
-        packageOk: ok,
-        // 若给了 dest，顺带比对目标位置
-        dest: dest ? checkDest(it, dest) : undefined,
-      });
-    }
-
-    const bad = results.filter((r) => !r.packageOk);
-    out({
-      ok: bad.length === 0,
-      packageIntact: bad.length === 0,
-      checked: results.length,
-      failed: bad.length,
-      failures: bad.slice(0, 20),
-      failuresTruncated: bad.length > 20 ? bad.length - 20 : 0,
-      note: bad.length
-        ? "包本身损坏或不完整 —— 重新导出，别拿这个包恢复"
-        : "包完整，每个文件的 sha256 与 manifest 一致",
-    });
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+  // 🔴 **不再落地解包**（2026-11-07）：
+  // 旧实现是 extractArchive 到临时目录（651MB 写盘）再逐个 readFileSync 算哈希 ——
+  // 同一份数据读了写、写了读，机械盘上光 I/O 就好几分钟。
+  // 现在一遍流过归档、边读边算 sha256，不产生任何磁盘写。
+  //
+  // 归档里的条目名带 `data/` 前缀，manifest 的 `relPath` 不带 —— 统一剥掉再比对。
+  const rawHashes = await require("./tar-writer.cjs").hashArchive(path.resolve(pkg));
+  const hashes = new Map();
+  for (const [k, v] of rawHashes) {
+    hashes.set(k.replace(/^data\//, ""), v);
   }
+
+  const results = [];
+  for (const it of mf.items || []) {
+    const got = hashes.get(it.relPath);
+    const ok = !!got && (!it.sha256 || got.sha256 === it.sha256);
+    results.push({
+      relPath: it.relPath,
+      category: it.category,
+      mode: it.restore && it.restore.mode,
+      target: it.restore && it.restore.target,
+      packageSha: it.sha256,
+      actualSha: got ? got.sha256 : null,
+      packageOk: ok,
+      // 若给了 dest，顺带比对目标位置
+      dest: dest ? await checkDest(it, dest, parseMap(argv)) : undefined,
+    });
+  }
+
+  // 归档里有、manifest 里没登记的文件（正常情况下不该有）
+  const listed = new Set((mf.items || []).map((i) => i.relPath));
+  const unlisted = [...hashes.keys()].filter((k) => !listed.has(k));
+
+  const bad = results.filter((r) => !r.packageOk);
+  out({
+    ok: bad.length === 0,
+    packageIntact: bad.length === 0,
+    checked: results.length,
+    failed: bad.length,
+    failures: bad.slice(0, 20),
+    failuresTruncated: bad.length > 20 ? bad.length - 20 : 0,
+    unlistedFiles: { count: unlisted.length, sample: unlisted.slice(0, 10) },
+    note: bad.length
+      ? "包本身损坏或不完整 —— 重新导出，别拿这个包恢复"
+      : "包完整，每个文件的 sha256 与 manifest 一致",
+  });
 }
 
 /** 检查某个条目在 dest 下的状态（用于 --dest 模式） */
-function checkDest(it, destRoot) {
+async function checkDest(it, destRoot, map) {
   const target = it.restore && it.restore.target;
   if (!target) return { status: "unknown" };
   const level = verifiabilityOf(it.restore.mode);
 
   // 把 restore.target 的占位符换成实际路径
-  const real = resolveTarget(target, destRoot);
+  const real = resolveTarget(target, destRoot, map);
   if (!real) return { status: "unresolvable", target };
 
   const exists = fs.existsSync(real);
   if (!exists) return { status: "missing", path: real };
 
-  const actual = sha256File(real);
-  if (level === "exact") {
-    return {
-      status: actual === it.sha256 ? "identical" : "different",
-      path: real,
-      actualSha: actual,
-      expectedSha: it.sha256,
-    };
+  if (level !== "exact") {
+    // 合并/追加型：内容必然不同，不能比 sha —— 也不用去读大文件
+    return { status: "exists", path: real, note: "合并型，内容预期不同（无法用 sha 比对）" };
   }
-  // 合并/追加型：内容必然不同，只能验存在
-  return { status: "exists", path: real, note: "合并型，内容预期不同（无法用 sha 比对）" };
+  const actual = await sha256File(real);
+  return {
+    status: actual === it.sha256 ? "identical" : "different",
+    path: real,
+    actualSha: actual,
+    expectedSha: it.sha256,
+  };
 }
 
-/** 把 `~/.claude/x` / `<workspace>/.claude/x` / `%APPDATA%/...` 解析成真实路径 */
-function resolveTarget(target, destRoot) {
-  let t = target;
+/**
+ * 把 `restore.target` 的占位符解析成**这台机器上的真实路径**。
+ *
+ * `destRoot` 只是"模拟根"（用来假设一台新机器长什么样）；
+ * 真正恢复完想核对时，应该让 destRoot 就是根（`/` 或 `C:\`），
+ * 或者用 `--map <占位符>=<真实路径>` 直接给出映射。
+ *
+ * @param {string} target   如 `~/.claude/settings.json`、`<workspace>/.claude/x`
+ * @param {string} destRoot 模拟根
+ * @param {Record<string,string>} [map] 显式映射，优先级最高
+ */
+function resolveTarget(target, destRoot, map) {
+  const t = target;
+
+  // ① 显式映射优先。要**按最长键优先**匹配 ——
+  //    否则 `~/.skills/x` 会先被 `~` 吃掉，更具体的 `~/.skills` 映射永远轮不到。
+  if (map) {
+    const keys = Object.keys(map).sort((a, b) => b.length - a.length);
+    for (const key of keys) {
+      const base = map[key];
+      if (!base) continue;
+      // `~` 既能匹配 `~/.claude/x`，也能匹配 `~/x`
+      const hit =
+        key === "~" ? t === "~" || t.startsWith("~/") :
+        t === key || t.startsWith(key + "/");
+      if (!hit) continue;
+      const rest = key === "~" ? t.replace(/^~\/?/, "") : t.slice(key.length + 1);
+      return rest ? path.join(base, rest) : base;
+    }
+  }
+
   if (t.startsWith("~/.claude/")) {
     return path.join(destRoot, ".claude", t.slice("~/.claude/".length));
   }
   if (t.startsWith("~/.agents/")) {
     return path.join(destRoot, ".agents", t.slice("~/.agents/".length));
+  }
+  // 有些包会把"个人技能库"导成 `~/.skills/...`（源机器上确实存在这个目录）；
+  // 但导入端不一定有 —— 这属于**需要重映射**的情况，不该一律报 unresolvable。
+  // `--map ~/.skills=<真实技能根>` 即可。
+  if (t.startsWith("~/.skills/")) {
+    return path.join(destRoot, ".skills", t.slice("~/.skills/".length));
   }
   if (t.startsWith("%APPDATA%/com.claudecode.gui/")) {
     return path.join(destRoot, "AppData", "Roaming", "com.claudecode.gui",
@@ -353,21 +419,39 @@ function resolveTarget(target, destRoot) {
   return null;
 }
 
+/**
+ * 解析 `--map a=b,c=d`。
+ * 键支持 `~` / `~/.skills` / `%APPDATA%` / `<workspace>`。
+ */
+function parseMap(argv) {
+  const raw = argOf(argv, "--map");
+  if (!raw) return undefined;
+  const map = {};
+  for (const pair of String(raw).split(",")) {
+    const i = pair.indexOf("=");
+    if (i <= 0) continue;
+    map[pair.slice(0, i).trim()] = expandHome(pair.slice(i + 1).trim());
+  }
+  return Object.keys(map).length ? map : undefined;
+}
+
 async function cmdCompare(argv) {
   const [pkg] = posArgs(argv);
   const dest = argOf(argv, "--dest");
   if (!pkg || !dest) die("用法：compare <包路径> --dest <目标根目录>");
   const mf = await readManifest(pkg);
 
-  const rows = (mf.items || []).map((it) => {
-    const d = checkDest(it, dest);
-    return {
+  const map = parseMap(argv);
+  const rows = [];
+  for (const it of mf.items || []) {
+    const d = await checkDest(it, dest, map);
+    rows.push({
       relPath: it.relPath,
       category: it.category,
       mode: it.restore && it.restore.mode,
       ...d,
-    };
-  });
+    });
+  }
 
   const count = (s) => rows.filter((r) => r.status === s).length;
   out({
@@ -400,12 +484,13 @@ async function cmdRate(argv) {
   if (!pkg || !dest) die("用法：rate <包路径> --dest <目标根目录>");
   const mf = await readManifest(pkg);
 
+  const map = parseMap(argv);
   const results = [];
   const detail = [];
   for (const it of mf.items || []) {
     const mode = (it.restore && it.restore.mode) || "overwrite";
     const level = verifiabilityOf(mode);
-    const d = checkDest(it, dest);
+    const d = await checkDest(it, dest, map);
 
     let verified;
     if (level === "unverifiable") {
@@ -464,14 +549,19 @@ async function cmdRate(argv) {
 async function cmdExtract(argv) {
   const [pkg] = posArgs(argv);
   const dest = argOf(argv, "--dest");
-  if (!pkg || !dest) die("用法：extract <包路径> --dest <目录>");
-  const r = await extractTo(path.resolve(pkg), path.resolve(dest));
+  const filter = argOf(argv, "--only");
+  if (!pkg || !dest) die("用法：extract <包路径> --dest <目录> [--only <正则>]");
+  const r = await extractTo(path.resolve(pkg), path.resolve(dest), filter);
   out({
     ok: true,
     extractedTo: path.resolve(dest),
     files: r.files,
     dirs: r.dirs,
-    note: "解包完成，但**没有**放到任何目标位置 —— 恢复要按 IMPORT_GUIDE 走",
+    skipped: r.skipped,
+    filtered: filter || null,
+    note: filter
+      ? `只解压了匹配 /${filter}/ 的 ${r.files} 个文件`
+      : "解包完成，但**没有**放到任何目标位置 —— 恢复要按 IMPORT_GUIDE 走",
   });
 }
 

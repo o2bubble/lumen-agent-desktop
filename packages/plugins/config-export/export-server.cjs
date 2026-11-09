@@ -842,6 +842,15 @@ async function doExport({ categories, outputPath, customItems } = {}) {
       customItems: customMeta,
       // 自定义项的"文档体检"结果（导出时算的，带进包让恢复端也知道）
       customAudit,
+      // 恢复用的快捷提示 —— 存进包内，别只活在导出结果里。
+      // 2026-11-07：用户换机器时根本想不起当初那句提示放在哪，
+      // 只能凭印象重述（"按流程走、别跳过"），指令就走了样。
+      // 此处 `out` 还没定义（在下面第 890 行），用 outputPath；为空时给个通用说法
+      restorePrompt:
+        `帮我用 ${outputPath ? path.basename(outputPath) : "这个备份包"} 恢复配置。` +
+        "先读包里的 IMPORT_GUIDE.md 和 RESTORE_REHEARSAL.md，" +
+        "用包里的 tools/restore-tools.cjs，不要临时写脚本。" +
+        "恢复前先评估这台机器的现状，把方案给我看，我确认后再动手。",
     };
 
     await fsp.writeFile(
@@ -900,7 +909,11 @@ async function doExport({ categories, outputPath, customItems } = {}) {
     // 🔴 用**自带的纯 Node 打包器**，不调系统 tar。
     // 原因见 tar-writer.cjs 文件头：Windows 上 PATH 里可能是 bsdtar，
     // 它不支持 `--force-local`（返回码 1），而我们还把 code<2 当成功了。
-    await packDirectory(staging, stagedPkg);
+    await packDirectory(staging, stagedPkg, {
+      // manifest 放最前面：restore-tools 的 list/compare/rate 只需读它，
+      // 放末尾会让每条命令都白解 651MB（见 tar-writer.packDirectory 注释）
+      first: ["manifest.json"],
+    });
 
     // 打包完了再搬。**先确认 staging 里真的有包** —— 否则后面 copyFile
     // 会报一个含糊的 ENOENT，看不出是"tar 没产出"还是"目标不可写"。
@@ -1108,6 +1121,9 @@ function buildRehearsal(manifest, checks) {
   L.push("> ⚠️ **不要说「备份已完成」就结束。**");
   L.push("> 用户要的是「这份备份**真的能恢复**」，不是「文件打包完了」。");
   L.push("");
+  L.push("推演时**别把本文档当死规矩** —— 它是导出门控，不是恢复手册。");
+  L.push("真正恢复时的路径/合并策略以目标机实际情况为准（详见 `IMPORT_GUIDE.md`）。");
+  L.push("");
   L.push("---");
   L.push("");
   L.push("## 附：manifest 摘要");
@@ -1136,6 +1152,25 @@ function buildImportGuide(manifest) {
   L.push("> 本文件由 `config-export` 插件生成，写给**导入端的 AI**。");
   L.push("> 目标是给你一个**流程框架**，不是替你做决定。遇到冲突时**先问用户**。");
   L.push("");
+  L.push("## 先说清楚：这份文档和随包脚本都是**参考**，不是教条");
+  L.push("");
+  L.push("导出端**没见过你要恢复的那台机器**。所以下面写的一切 —— 目标路径、");
+  L.push("合并策略、脚本用法 —— 都只是**基于常见情况的默认值**。");
+  L.push("");
+  L.push("**你的判断优先于本文档。** 下面这些情况，该改就改，不用照抄：");
+  L.push("");
+  L.push("| 情况 | 你可以怎么做 |");
+  L.push("|---|---|");
+  L.push("| 目标机目录布局和本文档假设的不一样 | 用 `restore-tools` 的 `--map` 重新映射，或自己定路径 |");
+  L.push("| 清单里的 `restore.target` 本身就是错的 | **以实际环境为准**，别硬按清单来 |");
+  L.push("| 某条脚本命令在你的场景下不适用 | 绕开它、改它的参数、或自己写一小段都行 |");
+  L.push("| 用户明确要另一种做法 | 听用户的，本文档让位 |");
+  L.push("");
+  L.push("**唯一的硬要求**：任何**破坏性 / 不可逆**的操作（覆盖、删除、整库替换）");
+  L.push("之前先备份、先问用户。除此之外，路径怎么定、用什么工具，都是你的判断。");
+  L.push("");
+  L.push("> 偏离默认做法时，请在报告里说明**为什么改** —— 否则用户会以为文档写错了。");
+  L.push("");
   L.push("## 这个包是什么");
   L.push("");
   L.push(`- 导出自：\`${manifest.source.hostname}\`（${manifest.source.platform}）`);
@@ -1143,6 +1178,18 @@ function buildImportGuide(manifest) {
   L.push(`- 格式版本：${manifest.formatVersion}`);
   L.push(`- 内置条目：${items.length} 个文件，分属 ${new Set(items.map((i) => i.category)).size} 个分类`);
   if (customs.length) L.push(`- **自定义项：${customs.length} 个**（详见第 2 步）`);
+  L.push("");
+  L.push("## 📋 恢复用的快捷提示（给用户）");
+  L.push("");
+  L.push("**把下面这段原样给用户**，让他下次开新会话时直接贴进输入框 ——");
+  L.push("这样新会话的 AI 一上来就知道该读什么、该用什么工具：");
+  L.push("");
+  L.push("```");
+  L.push(manifest.restorePrompt || "帮我用这个备份包恢复配置，按包里的 IMPORT_GUIDE.md 走。");
+  L.push("```");
+  L.push("");
+  L.push("> 恢复完成后，**提醒用户把这段存起来**（笔记 / 快捷提示），");
+  L.push("> 或者干脆把整个包留好 —— 下次换机器还得用。");
   L.push("");
 
   L.push("## 第 0 步：先读 `manifest.json`");
@@ -1156,10 +1203,13 @@ function buildImportGuide(manifest) {
   // 🔴 **这不是一个"照着清单拷文件"的任务。**
   // 新机器上可能已经有：装好的插件、跑过几个会话、改过的设置、自己的记忆。
   // 直接按固定模式覆盖 = 毁掉用户在新机器上已有的东西。
-  L.push("## ⚠️ 第 0 步：先评估新机器现状（**不能跳过**）");
+  L.push("## ⚠️ 第 0 步：先评估新机器现状（**别跳过这步**）");
   L.push("");
-  L.push("**恢复不是「解压了就完事」。** 恢复前你必须先摸清这台机器现在是什么状态，");
-  L.push("否则你可能会覆盖掉用户在**这台机器上**已经积累的东西。");
+  L.push("**恢复不是「解压了就完事」。** 恢复前先摸清这台机器现在是什么状态，");
+  L.push("否则可能覆盖掉用户在**这台机器上**已经积累的东西。");
+  L.push("");
+  L.push("> 怎么查随你 —— 列目录、读配置、问用户都行。下面的表是**起点不是清单**：");
+  L.push("> 这台机器的情况和你预想的不一样时，按实际情况调整查什么。");
   L.push("");
   L.push("### 必须实地检查的（用工具查，别猜）");
   L.push("");
@@ -1198,6 +1248,10 @@ function buildImportGuide(manifest) {
   L.push("| **`data.db`（桌面/计划）** | 新机器已有画布内容 | **必须问用户**。无法自动合并（SQLite 二进制） |");
   L.push("| **技能** | 同名技能版本不同 | 看是否是同一来源；不同来源问用户 |");
   L.push("| **插件** | 版本不同 | 建议**保持新机器版本**（更新的通常是新版），只补缺的 |");
+  L.push("");
+  L.push("> 上面是**经验方向，不是规则**。真实情况常常比这复杂（比如包里的「新版本」");
+  L.push("> 其实是旧版、两边各有对方没有的内容）—— **以你实际看到的差异为准**，");
+  L.push("> 拿不准就把两边的差异摆给用户看。");
   L.push("");
   L.push("");
   L.push("### 做任何破坏性操作前");
@@ -1396,16 +1450,21 @@ function buildImportGuide(manifest) {
         L.push("");
       }
     }
+  }  // ← 自定义项段落结束（没有自定义项时，下面的工具说明/验证/清理同样要给）
 
-    L.push("## 第 3 步：验证与报告");
-    L.push("");
-    L.push("- 每个 `verifyPrompt` 跑一遍，把**实际输出**给用户看（别只说「已完成」）");
-    L.push("- 第 1 步里 `manual` 模式的条目，逐项确认用户已经决定");
-    L.push("- 最后总结：恢复了什么、跳过了什么、哪些需要用户手动接手");
-    L.push("");
+  // ⚠️ 这一整段**必须无条件输出**（2026-11-07 修）：
+  // 原来它写在 `if (customs.length)` 里面 —— 没有自定义项的包（很常见）
+  // 恢复端 AI 就完全看不到 tools/ 怎么用、恢复率怎么报。实测踩到。
 
-    // ── 自带的工具脚本 ──
-    L.push("### 包内自带工具（`tools/restore-tools.cjs`）");
+  L.push("## 第 3 步：验证与报告");
+  L.push("");
+  L.push("- 每个 `verifyPrompt` 跑一遍，把**实际输出**给用户看（别只说「已完成」）");
+  L.push("- 第 1 步里 `manual` 模式的条目，逐项确认用户已经决定");
+  L.push("- 最后总结：恢复了什么、跳过了什么、哪些需要用户手动接手");
+  L.push("");
+
+  // ── 自带的工具脚本 ──
+  L.push("### 包内自带工具（`tools/restore-tools.cjs`）");
     L.push("");
     L.push("**不要临场写脚本** —— 下面这些是固定套路，直接用：");
     L.push("");
@@ -1429,6 +1488,51 @@ function buildImportGuide(manifest) {
     L.push("");
     L.push("全部输出 **JSON**，直接解析即可。出错时 exit code ≠ 0。");
     L.push("");
+    L.push("#### ⏱ 哪些命令慢，别干等");
+    L.push("");
+    L.push("包是 **tar.gz 顺序流** —— 读第 N 个条目要把前面所有字节解压一遍。");
+    L.push("但**解压本身很快**：651MB 的包整体 gunzip 只要 2 秒左右。");
+    L.push("所以正确定价是「秒级～一两分钟」，不是「几十分钟」。");
+    L.push("");
+    L.push("> ⚠️ **如果某条命令跑了几分钟还没出结果，先怀疑有问题，别继续等。**");
+    L.push("> 2026-11 真实事故：恢复端跑 `list` 花了约 3 分钟、整包解压半小时级，");
+    L.push("> 原因是**发出去的插件包里打的是旧版脚本**（内存里反复整块拷贝，");
+    L.push("> 复杂度 O(n²)），不是包太大。同一份包用修好的脚本：读 manifest 2 秒。");
+    L.push("> 所以 —— 慢到这个程度就是 bug，停下来查，别用更长的时间去验证它慢。");
+    L.push("");
+    L.push("| 命令 | 大致耗时 | 说明 |");
+    L.push("|---|---|---|");
+    L.push("| `list` | 秒级 | 只读 manifest（新版包已把它放最前面）|");
+    L.push("| `verify` | 与包大小成正比 | 必须扫全包，但只算哈希不写盘。651MB ≈ 5 秒 |");
+    L.push("| `compare` / `rate` | 秒级 + 目标盘 I/O | 只扫目标机上的文件，不扫包体 |");
+    L.push("| `extract`（整包） | 几十秒 + 写盘 | 692MB ≈ 30 秒。除非真要全量，否则用 `--only` |");
+    L.push("| `extract --only` | 秒级 | 只把匹配的落盘，其余跳过。取十几个文件 ≈ 2 秒 |");
+    L.push("");
+    L.push("**实测参考**（651MB / 28000 文件，机械盘）：`list` 2 秒、`verify` 5 秒、");
+    L.push("`rate` 20 秒、整包 `extract` 30 秒、`--only` 2 秒。");
+    L.push("");
+    L.push("#### 🔴 路径未必对得上：导出机 ≠ 这台机器");
+    L.push("");
+    L.push("这是**最容易踩的坑** —— 包内所有路径都来自导出机：");
+    L.push("");
+    L.push("| 差异 | 典型表现 | 怎么办 |");
+    L.push("|---|---|---|");
+    L.push("| 用户名不同 | `C:\\Users\\SZH\\...` → 这台是 `C:\\Users\\ME\\` | 按**本机**实际家目录重映射 |");
+    L.push("| 盘符/目录不同 | 导出在 `C:\\Storage\\proj`，这台在 `D:\\Development\\proj` | 找到本机对应的项目目录 |");
+    L.push("| 目录根本不存在 | 包里有 `~/.skills/`，这台没这个目录 | 放到本机**等效位置**（如 `~/.claude/skills/`），或问用户 |");
+    L.push("| 清单目标写错 | `restore.target` 指向本机不用的路径 | 以实际环境为准，别硬按清单 |");
+    L.push("");
+    L.push("`compare` / `rate` / `verify` 支持 `--map` 显式重映射（按**最长前缀**匹配）：");
+    L.push("");
+    L.push("```bash");
+    L.push('node tools/restore-tools.cjs rate <包> --dest "C:/" \\');
+    L.push('  --map "~=C:/Users/ME,~/.skills=C:/Users/ME/.claude/skills,<workspace>=D:/proj"');
+    L.push("```");
+    L.push("");
+    L.push("**判断标准**：恢复后跑 `rate`，如果**某一整类**都报 `unresolvable` / `missing`，");
+    L.push("八成是路径没对上 —— **别急着说「恢复失败」**，先确认这类文件在这台机器究竟该放哪。");
+    L.push("找不到等效位置就问用户，别硬塞进一个差不多的目录。");
+    L.push("");
     L.push("### 🔴 恢复率怎么报（重要）");
     L.push("");
     L.push("`rate` 会返回**两个数**，**不要合成一个**：");
@@ -1451,9 +1555,8 @@ function buildImportGuide(manifest) {
     L.push("  · 自定义项 X盘同步（需按你的文档验证）");
     L.push("```");
     L.push("");
-    L.push("**别只说「恢复完成」** —— 要说清楚哪部分验过、哪部分没验、为什么。");
-    L.push("");
-  }
+  L.push("**别只说「恢复完成」** —— 要说清楚哪部分验过、哪部分没验、为什么。");
+  L.push("");
 
   // ── 会话合并的专项指引（用户特别提到的场景）──
   const hasSessions = items.some((i) => i.category === "claude-sessions");
@@ -1507,6 +1610,50 @@ function buildImportGuide(manifest) {
   L.push("- `restore.mode: manual` 是**真的没有标准答案**，别猜。");
   L.push("- 自定义项的**顺序可能有讲究**（用户在 entryDoc 里写了就照做）。");
   L.push("- 恢复前建议**先备份当前状态**（再导一次，或手动拷贝关键文件）。");
+  L.push("- 本文档和 `tools/` 里的脚本都是**参考实现**，目标机情况不同就以实际情况为准。");
+  L.push("");
+  L.push("### ⏳ 别用「继续等」来对付慢命令");
+  L.push("");
+  L.push("**先给命令一个合理的预期，再决定要不要等。**");
+  L.push("");
+  L.push("- 上表的耗时都是**秒级到几十秒**。超过这个量级 = 有问题，停下查。");
+  L.push("- **不要**用 `sleep` 反复轮询一个没动静的后台任务 —— 卡住本身就是信号，");
+  L.push("  应该杀掉去看它卡在哪，而不是排队等着。等待会让用户干瞪眼。");
+  L.push("- **不要**为了「验证某个操作到底多慢」而真的把它跑完 —— ");
+  L.push("  已知会慢的操作，用更小的样本或直接读代码判断就够。");
+  L.push("- 真要跑长任务，**先说清楚预计多久**，让用户自己决定要不要等。");
+  L.push("");
+  L.push("---");
+  L.push("");
+  L.push("## 🧹 收尾：问用户要不要清理临时文件");
+  L.push("");
+  L.push("**恢复跑完后，主动问用户一句**（别自作主张删，也别默默留着）——");
+  L.push("恢复过程往往会在磁盘上留下这些东西：");
+  L.push("");
+  L.push("| 会产生什么 | 大约多大 | 说明 |");
+  L.push("|---|---|---|");
+  L.push("| 解包出来的临时目录 | **最大头**，可能和包一样大 | `extract` 的解压目标 |");
+  L.push("| 恢复前的备份副本 | 与改动量相当 | `.bak-*` / 你手动建的备份目录 |");
+  L.push("| 临时脚本 / 中间产物 | 小 | 你为了排查临时写的文件 |");
+  L.push("| 备份包本身 | 见包大小 | 用户可能想保留 |");
+  L.push("");
+  L.push("**问法建议**：");
+  L.push("");
+  L.push("```");
+  L.push("恢复完成了。过程中留下了这些临时文件：");
+  L.push("  · <路径>  （约 XXX MB）—— 解包用的临时目录，可以删");
+  L.push("  · <路径>  （约 XXX MB）—— 恢复前的备份，建议**先别删**，等确认没问题再删");
+  L.push("");
+  L.push("要我现在帮你清理吗？备份包本身要不要保留？");
+  L.push("```");
+  L.push("");
+  L.push("**注意**：");
+  L.push("");
+  L.push("- **备份副本不要和临时文件一起删** —— 那是回滚的唯一退路。明确分开说，");
+  L.push("  并建议用户先用几天确认没问题再清。");
+  L.push("- **备份包（`*.tar.gz`）由用户决定**：可能还要留着去第三台机器恢复。");
+  L.push("- 只清你自己创建的东西；**别去删用户原有的文件**。");
+  L.push("- 用户说不用清就到此为止，把路径留在报告里即可。");
   L.push("");
   return L.join("\n");
 }

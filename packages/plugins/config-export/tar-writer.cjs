@@ -23,6 +23,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const zlib = require("zlib");
+const crypto = require("crypto");
 const { pipeline } = require("stream/promises");
 
 const BLOCK = 512;
@@ -176,8 +177,30 @@ async function collectEntries(rootDir) {
  *
  * @returns {Promise<{entries:number, bytes:number}>}
  */
-async function packDirectory(rootDir, outGzPath) {
-  const entries = await collectEntries(rootDir);
+async function packDirectory(rootDir, outGzPath, opts = {}) {
+  let entries = await collectEntries(rootDir);
+
+  // 把指定条目挪到最前面。
+  //
+  // 🔴 **manifest.json 必须在开头**（2026-11-07 实测）：
+  // tar.gz 是顺序流，读第 N 个条目要先把前面所有字节 gunzip 一遍。
+  // 原来按字母序打包，manifest.json 排在 data/ 之后 → **归档最后一条**，
+  // 于是 restore-tools 的 list / compare / rate 每次都要解 651MB / 29000 条，
+  // 光 `list` 就花了 **3 分 17 秒**（它其实只读 14MB 的 manifest）。
+  // 挪到开头后同样的命令秒出。
+  const first = (opts.first || []).map((s) => s.replace(/^\.?\/+/, ""));
+  if (first.length) {
+    const rank = new Map(first.map((n, i) => [n, i]));
+    const head = [];
+    const tail = [];
+    for (const e of entries) {
+      const r = rank.get(e.rel);
+      if (r === undefined) tail.push(e);
+      else head.push({ ...e, _rank: r });
+    }
+    head.sort((a, b) => a._rank - b._rank);
+    entries = head.concat(tail);
+  }
 
   const gzip = zlib.createGzip({ level: 6 });
   const out = fs.createWriteStream(outGzPath);
@@ -329,12 +352,19 @@ async function listArchive(gzPath) {
  *
  * @returns {Promise<{files:number, dirs:number}>}
  */
-async function extractArchive(gzPath, destDir) {
+/**
+ * @param {string} gzPath
+ * @param {string} destDir
+ * @param {string} [onlyRe] 只解压路径匹配该正则的条目（其余只跳过、不写盘）
+ */
+async function extractArchive(gzPath, destDir, onlyRe) {
   await fsp.mkdir(destDir, { recursive: true });
   const destAbs = path.resolve(destDir);
+  const matcher = onlyRe ? new RegExp(onlyRe) : null;
 
   let files = 0;
   let dirs = 0;
+  let skipped = 0;
   let pending = Buffer.alloc(0);
   let pendingLongName = null;
   let stopped = false;
@@ -372,6 +402,19 @@ async function extractArchive(gzPath, destDir) {
   let curRemain = 0;     // 这个 entry 还剩多少字节没写
   let curPadding = 0;    // 写完正文后还要跳过的对齐字节
 
+  // GNU LongLink 的正文也可能跨 chunk
+  let longChunks = null;
+  let longRemain = 0;
+  let longPadding = 0;
+  let longPaddingLeft = 0;
+
+  // 被 `--only` 跳过 / 不安全路径 / 非普通文件 —— 还要跳过多少字节。
+  // 🔴 **不能 `off += n` 一步跳**：n 可能远大于当前 buf 剩下长度（正文动辄几十 MB，
+  // 一个 chunk 才 64KB）。越过 buf 的偏移会带到下一个 chunk 上 → 头部解析全错、
+  // 无限循环（2026-11-07 实测：`--only` 在 651MB 包上卡死）。
+  let skipRemain = 0;
+  const queueSkip = (n) => { skipRemain = n; };
+
   const closeCur = () => {
     if (curFd !== null) {
       try { fs.closeSync(curFd); } catch { /* 已关 */ }
@@ -392,6 +435,34 @@ async function extractArchive(gzPath, destDir) {
         let off = 0;
 
         while (off < buf.length) {
+          // ⓪ 正在收集 GNU 长文件名（可能跨 chunk）
+          if (longRemain > 0) {
+            const take = Math.min(longRemain, buf.length - off);
+            longChunks.push(Buffer.from(buf.subarray(off, off + take)));
+            off += take;
+            longRemain -= take;
+            if (longRemain === 0) {
+              pendingLongName = Buffer.concat(longChunks).toString("utf8").replace(/\0+$/, "");
+              longChunks = null;
+              longPaddingLeft = longPadding;
+            }
+            continue;
+          }
+          if (longPaddingLeft > 0) {
+            const skip = Math.min(longPaddingLeft, buf.length - off);
+            off += skip;
+            longPaddingLeft -= skip;
+            continue;
+          }
+
+          // ⓪' 需要跳过的正文（被过滤 / 非普通文件）—— 逐 chunk 消化
+          if (skipRemain > 0) {
+            const skip = Math.min(skipRemain, buf.length - off);
+            off += skip;
+            skipRemain -= skip;
+            continue;
+          }
+
           // ① 正在写某个文件的正文 → 直接 append，不攒内存
           if (curRemain > 0) {
             const take = Math.min(curRemain, buf.length - off);
@@ -428,23 +499,31 @@ async function extractArchive(gzPath, destDir) {
           off += BLOCK;
 
           if (type === "L") {
-            // GNU 长文件名：这本身是个数据块
-            if (buf.length - off < size) {
-              throw new Error("长文件名块不完整（暂不支持跨块）");
-            }
-            pendingLongName = buf.subarray(off, off + size).toString("utf8").replace(/\0+$/, "");
-            off += size + padding(size);
+            // GNU 长文件名：这本身是个数据块，**可能跨 chunk**（GNU 的 L
+            // 条目按路径长度算，长路径 200+ 字节，chunk 边界随时会切开它）。
+            // 用和正文相同的「剩余多少」状态机，不要假设它在当前 buf 里放得下。
+            longChunks = [];
+            longRemain = size;
+            longPadding = padding(size);
             continue;
           }
 
           let name = prefix ? `${prefix}/${nameRaw}` : nameRaw;
           if (pendingLongName) { name = pendingLongName; pendingLongName = null; }
 
+          // `--only` 过滤：不匹配的条目只推进偏移，不建目录、不写文件。
+          // 匹配对象是**剥掉 `./` 和 `data/` 之后**的路径 —— 与 manifest 的
+          // `relPath` 同一套写法，AI 才不用猜包内前缀。
+          const wanted = !matcher ||
+            matcher.test(name.replace(/^\.\/+/, "").replace(/^data\//, ""));
+
           if (type === "5") {
+            if (!wanted) { skipped++; queueSkip(size + padding(size)); continue; }
             const target = safeJoin(name);
             if (target) { fs.mkdirSync(target, { recursive: true }); dirs++; }
-            off += padding(size);
+            queueSkip(padding(size));
           } else if (type === "0" || type === "\0") {
+            if (!wanted) { skipped++; queueSkip(size + padding(size)); continue; }
             const target = safeJoin(name);
             if (target) {
               fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -453,11 +532,11 @@ async function extractArchive(gzPath, destDir) {
               curPadding = padding(size);
               if (size === 0) { closeCur(); curPadding = 0; }
             } else {
-              off += size + padding(size); // 不安全的路径 → 整块跳过
+              queueSkip(size + padding(size)); // 不安全的路径 → 整块跳过
             }
           } else {
             // 其它类型（符号链接 / 设备文件等）→ 跳过正文
-            off += size + padding(size);
+            queueSkip(size + padding(size));
           }
         }
 
@@ -477,7 +556,155 @@ async function extractArchive(gzPath, destDir) {
     rs.pipe(gunzip);
   });
 
-  return { files, dirs };
+  return { files, dirs, skipped };
+}
+
+/**
+ * 一次性扫过整个归档，**边读边算每个文件的 sha256**（不落盘）。
+ *
+ * 🔴 **为什么要有它**（2026-11-07）：
+ * 原来的 `verify` 是「先 extractArchive 到临时目录（651MB 落盘），
+ * 再逐个 readFileSync 算哈希」—— 同一份数据读了写、写了读，
+ * 在机械盘上光 I/O 就要好几分钟，还多占 651MB 临时空间。
+ *
+ * 这里复用 extractArchive 的状态机，但正文**只更新哈希，不写文件**。
+ * 比 extractArchive 还快：不产生任何磁盘写。
+ *
+ * @param {string} gzPath
+ * @param {{onEntry?:(info:{relPath:string,size:number,sha256:string})=>void}} [opts]
+ * @returns {Promise<Map<string,{size:number,sha256:string}>>} relPath → 信息
+ */
+async function hashArchive(gzPath, opts = {}) {
+  const out = new Map();
+  let pending = Buffer.alloc(0);
+  let pendingLongName = null;
+  let stopped = false;
+
+  let curRel = null;     // 正在算哈希的条目
+  let curHash = null;
+  let curSize = 0;
+  let curRemain = 0;
+  let curPadding = 0;
+  let curDeclared = 0;
+
+  // GNU LongLink 的正文也可能跨 chunk
+  let longChunks = null;
+  let longRemain = 0;
+  let longPadding = 0;
+  let longPaddingLeft = 0;
+
+  const finishCur = () => {
+    if (curRel !== null) {
+      const v = { size: curDeclared, sha256: curHash.digest("hex") };
+      out.set(curRel, v);
+      if (opts.onEntry) opts.onEntry({ relPath: curRel, ...v });
+      curRel = null;
+      curHash = null;
+    }
+  };
+
+  await new Promise((resolve, reject) => {
+    const rs = fs.createReadStream(gzPath, { highWaterMark: 1024 * 1024 });
+    const gunzip = zlib.createGunzip();
+
+    gunzip.on("data", (chunk) => {
+      if (stopped) return;
+      try {
+        let buf = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+        let off = 0;
+
+        while (off < buf.length) {
+          // ⓪ GNU 长文件名（可能跨 chunk）
+          if (longRemain > 0) {
+            const take = Math.min(longRemain, buf.length - off);
+            longChunks.push(Buffer.from(buf.subarray(off, off + take)));
+            off += take;
+            longRemain -= take;
+            if (longRemain === 0) {
+              pendingLongName = Buffer.concat(longChunks).toString("utf8").replace(/\0+$/, "");
+              longChunks = null;
+              longPaddingLeft = longPadding;
+            }
+            continue;
+          }
+          if (longPaddingLeft > 0) {
+            const skip = Math.min(longPaddingLeft, buf.length - off);
+            off += skip;
+            longPaddingLeft -= skip;
+            continue;
+          }
+
+          // ① 正在收集正文 → 只喂哈希
+          if (curRemain > 0) {
+            const take = Math.min(curRemain, buf.length - off);
+            curHash.update(buf.subarray(off, off + take));
+            off += take;
+            curRemain -= take;
+            curSize += take;
+            // ⚠️ 大小恰为 512 整数倍时 padding 为 0，收尾不能只靠 ② 那条分支 ——
+            // 否则这条永远不 finish，被下一条直接覆盖掉（实测丢了 85 个文件）
+            if (curRemain === 0 && curPadding === 0) finishCur();
+            continue;
+          }
+          // ② 对齐填充
+          if (curPadding > 0) {
+            const skip = Math.min(curPadding, buf.length - off);
+            off += skip;
+            curPadding -= skip;
+            if (curPadding === 0) finishCur();
+            continue;
+          }
+          // ③ 头部
+          if (buf.length - off < BLOCK) break;
+          const h = buf.subarray(off, off + BLOCK);
+          if (h.every((b) => b === 0)) { off = buf.length; break; }
+
+          const nameRaw = h.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
+          const prefix = h.subarray(345, 500).toString("utf8").replace(/\0.*$/, "");
+          const sizeStr = h.subarray(124, 136).toString("ascii").replace(/\0.*$/, "").trim();
+          const size = parseInt(sizeStr || "0", 8) || 0;
+          const type = String.fromCharCode(h[156]);
+          off += BLOCK;
+
+          if (type === "L") {
+            longChunks = [];
+            longRemain = size;
+            longPadding = padding(size);
+            continue;
+          }
+
+          let name = prefix ? `${prefix}/${nameRaw}` : nameRaw;
+          if (pendingLongName) { name = pendingLongName; pendingLongName = null; }
+          const clean = name.replace(/^\.\/+/, "");
+
+          if (type === "0" || type === "\0") {
+            curRel = clean;
+            curHash = crypto.createHash("sha256");
+            curSize = 0;
+            curDeclared = size;
+            curRemain = size;
+            curPadding = padding(size);
+            if (size === 0) { finishCur(); curPadding = 0; }
+          } else {
+            // 目录 / 其它类型：没有正文要算
+            off += size + padding(size);
+          }
+        }
+        pending = off < buf.length ? Buffer.from(buf.subarray(off)) : Buffer.alloc(0);
+      } catch (e) {
+        stopped = true;
+        gunzip.destroy();
+        reject(e);
+      }
+    });
+
+    gunzip.on("error", (e) => { if (!stopped) { stopped = true; reject(e); } });
+    gunzip.on("end", () => { if (!stopped) { stopped = true; finishCur(); resolve(); } });
+    rs.on("error", (e) => { if (!stopped) { stopped = true; reject(e); } });
+    rs.pipe(gunzip);
+  });
+
+  return out;
 }
 
 /**
@@ -502,6 +729,12 @@ async function readEntry(gzPath, entryName) {
   let wantChunks = null;
   let wantRemain = 0;
 
+  // GNU LongLink 的正文也可能跨 chunk
+  let longChunks = null;
+  let longRemain = 0;
+  let longPadding = 0;
+  let longPaddingLeft = 0;
+
   await new Promise((resolve, reject) => {
     const rs = fs.createReadStream(gzPath);
     const gunzip = zlib.createGunzip();
@@ -513,6 +746,26 @@ async function readEntry(gzPath, entryName) {
       let off = 0;
 
       while (off < buf.length) {
+        // ⓪ GNU 长文件名（可能跨 chunk）
+        if (longRemain > 0) {
+          const take = Math.min(longRemain, buf.length - off);
+          longChunks.push(Buffer.from(buf.subarray(off, off + take)));
+          off += take;
+          longRemain -= take;
+          if (longRemain === 0) {
+            pendingLongName = Buffer.concat(longChunks).toString("utf8").replace(/\0+$/, "");
+            longChunks = null;
+            longPaddingLeft = longPadding;
+          }
+          continue;
+        }
+        if (longPaddingLeft > 0) {
+          const skip = Math.min(longPaddingLeft, buf.length - off);
+          off += skip;
+          longPaddingLeft -= skip;
+          continue;
+        }
+
         // ① 跳过不关心的 entry
         if (skipRemain > 0) {
           const take = Math.min(skipRemain, buf.length - off);
@@ -547,9 +800,9 @@ async function readEntry(gzPath, entryName) {
         off += BLOCK;
 
         if (type === "L") {
-          if (buf.length - off < size) throw new Error("长文件名块不完整（暂不支持跨块）");
-          pendingLongName = buf.subarray(off, off + size).toString("utf8").replace(/\0+$/, "");
-          off += size + padding(size);
+          longChunks = [];
+          longRemain = size;
+          longPadding = padding(size);
           continue;
         }
 
@@ -578,4 +831,6 @@ async function readEntry(gzPath, entryName) {
   return found;
 }
 
-module.exports = { packDirectory, listArchive, collectEntries, extractArchive, readEntry };
+module.exports = {
+  packDirectory, listArchive, collectEntries, extractArchive, readEntry, hashArchive,
+};
