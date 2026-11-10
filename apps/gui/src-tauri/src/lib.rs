@@ -92,9 +92,46 @@ fn process_alive(pid: u32) -> bool {
         ok != 0 && code == STILL_ACTIVE as u32
     }
 }
+/// pid 进程是否存活（mac/Linux）。
+///
+/// 走 `process_start_time_ms` 同一套实现 —— 它能区分僵尸进程，且不需要
+/// 为「只是看看活着没有」再写一份 syscall。返回 None（取不到）即当死。
 #[cfg(not(windows))]
-fn process_alive(_pid: u32) -> bool {
-    false
+fn process_alive(pid: u32) -> bool {
+    crate::instances::process_start_time_ms(pid).is_some()
+}
+
+/// 杀掉一个进程**及其子进程**（平台无关入口）。
+///
+/// Windows 走 `prockill`（Win32 原生树杀）；mac/Linux 没有对应模块，
+/// 此前只 `child.kill()` 直接子进程 —— 但插件与 IDE 后端的实际进程模型是
+/// `node server.cjs` → 可能再 spawn 子进程，父进程一死子进程就被 init 收养，
+/// 变成用户杀不掉的孤儿（踩过：cwd 钉在插件目录 → 卸载报 os error 32）。
+/// 这里先清子进程（`pkill -P`），再 SIGTERM → 1s 宽限 → SIGKILL。
+pub(crate) fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        crate::prockill::kill_process_tree(pid);
+    }
+    #[cfg(not(windows))]
+    {
+        let id = pid.to_string();
+        // 子进程先杀：父进程一退出，它们会被 init 收养，`-P` 就找不到了
+        let _ = std::process::Command::new("pkill").args(["-P", &id]).status();
+        let _ = std::process::Command::new("kill").args(["-TERM", &id]).status();
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &id])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+        }
+        let _ = std::process::Command::new("kill").args(["-KILL", &id]).status();
+    }
 }
 
 /// 尝试成为「绑定工作区」的第一个实例：独占创建锁文件。
@@ -250,6 +287,31 @@ pub(crate) fn prepend_tool_dirs(install_dir: &std::path::Path, orig: &str) -> St
     for entry in orig.split(sep).filter(|s| !s.is_empty()) {
         if !dirs.iter().any(|d| d.eq_ignore_ascii_case(entry)) {
             dirs.push(entry.to_string());
+        }
+    }
+    // macOS：从 Finder / Dock 启动的 App **不继承 shell 的 PATH**，只有
+    // `/usr/bin:/bin:/usr/sbin:/sbin`。Homebrew 装的 node / git / python
+    // 全在 /opt/homebrew/bin（Apple Silicon）或 /usr/local/bin（Intel），
+    // 不加进来，所有 spawn 用户工具的地方都会「command not found」。
+    // 内置工具仍排在最前，所以不会盖掉自带的 rg/fd/bun。
+    #[cfg(target_os = "macos")]
+    {
+        let mut extra: Vec<String> = vec![
+            "/opt/homebrew/bin".into(),
+            "/opt/homebrew/sbin".into(),
+            "/usr/local/bin".into(),
+            "/usr/local/sbin".into(),
+            "/opt/local/bin".into(), // MacPorts
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::PathBuf::from(home);
+            extra.push(home.join(".local/bin").to_string_lossy().to_string());
+            extra.push(home.join(".bun/bin").to_string_lossy().to_string());
+        }
+        for d in extra {
+            if std::path::Path::new(&d).is_dir() && !dirs.iter().any(|x| x == &d) {
+                dirs.push(d);
+            }
         }
     }
     dirs.join(&sep.to_string())
@@ -1654,21 +1716,9 @@ fn app_relaunch() -> Result<(), String> {
     // exit(0) 绕过 RunEvent::Exit 的 kill_all_plugin_processes → 会遗留孤儿插件进程
     // （cwd 钉在插件目录 → 卸载报 os error 32）。显式补一次清理。
     crate::plugin_process::kill_all_plugin_processes();
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: 独立于本进程生命周期
-        std::process::Command::new(&exe)
-            .creation_flags(0x00000008 | 0x00000200)
-            .spawn()
-            .map_err(|e| format!("Cannot spawn new instance: {}", e))?;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new(&exe)
-            .spawn()
-            .map_err(|e| format!("Cannot spawn new instance: {}", e))?;
-    }
+    // 与「新建窗口」走同一条路径：mac 必须 `open -n`，见 spawn_detached_instance。
+    spawn_detached_instance()
+        .map_err(|e| format!("Cannot spawn new instance: {}", e))?;
     // 给新实例启动留窗口, 然后释放本进程（文件锁/端口/MCP server 一并释放）
     std::thread::sleep(std::time::Duration::from_millis(800));
     std::process::exit(0);
@@ -4258,9 +4308,12 @@ fn force_foreground(window: &tauri::WebviewWindow) -> bool {
     }
 }
 
+/// macOS / Linux：没有 Windows 那种「前台锁定」，`set_focus()` 就是正解
+/// （调用方已经调过）。这里只**核对结果**，别硬编码 false —— 那会让每次
+/// 成功聚焦都打一条「未能把主窗带到前台」的假警告，真出问题时反而看不见。
 #[cfg(not(windows))]
-fn force_foreground(_window: &tauri::WebviewWindow) -> bool {
-    false
+fn force_foreground(window: &tauri::WebviewWindow) -> bool {
+    window.is_focused().unwrap_or(false)
 }
 
 /// 关闭某插件的全部 overlay 窗口（插件主动收起 / 禁用 / 退出时清理）。
@@ -4291,7 +4344,20 @@ fn count_gui_instances() -> usize {
     }
     #[cfg(not(windows))]
     {
-        1
+        // mac 没有「按进程名数兄弟」的原生实现（prockill 是 Win32 专属）。
+        // 用实例注册表：每个 GUI 启动时都会写一份自述，判活现在也是真实现
+        // （见 shared/src/instances.rs 的 macOS 分支），数出来就是真实实例数。
+        // 至少返回 1（自己）—— 前端用它区分「热键被别的实例占了」和「被别的软件占了」。
+        crate::instances::app_data_dir_early()
+            .map(|dir| {
+                crate::instances::collect_live_instances(
+                    &dir,
+                    crate::instances::is_instance_alive,
+                )
+                .len()
+                .max(1)
+            })
+            .unwrap_or(1)
     }
 }
 
@@ -5464,10 +5530,14 @@ fn open_system_terminal(app: tauri::AppHandle, _terminal_type: String, work_dir:
     Ok(())
 }
 
-/// 拉起一个新的 GUI 实例。macOS 双击 .app 走 LaunchServices 会复用已运行实例（多实例
-/// 起不来），这里用 `open -n` 强制开新进程；Windows 直接拉起当前 exe（普通多实例）。
-#[tauri::command]
-fn spawn_gui_instance() -> Result<(), String> {
+/// 拉起一个新的 GUI 实例（**唯一**的「从自己再开一份」实现）。
+///
+/// macOS 双击 .app 走 LaunchServices 会复用已运行实例（多实例起不来），
+/// 所以必须 `open -n` 强制开新进程；直接 spawn `Contents/MacOS/claude-code-gui`
+/// 能起来，但绕过了 LaunchServices —— Dock 图标归属、激活策略、TCC 权限
+/// 都与正常启动不一致（表现为新窗口不在前台 / 被当成同一进程）。
+/// Windows 直接拉起当前 exe（普通多实例）。
+fn spawn_detached_instance() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
     #[cfg(target_os = "macos")]
     {
@@ -5480,14 +5550,28 @@ fn spawn_gui_instance() -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("open -n 失败: {}", e))?;
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // 启动即新建实例（启动路径里已没有唤醒逻辑，不需要额外参数）
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: 独立于本进程生命周期
+        std::process::Command::new(&exe)
+            .creation_flags(0x00000008 | 0x00000200)
+            .spawn()
+            .map_err(|e| format!("spawn 失败: {}", e))?;
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
         std::process::Command::new(&exe)
             .spawn()
             .map_err(|e| format!("spawn 失败: {}", e))?;
     }
     Ok(())
+}
+
+/// 拉起一个新的 GUI 实例（前端「新建窗口」入口）。
+#[tauri::command]
+fn spawn_gui_instance() -> Result<(), String> {
+    spawn_detached_instance()
 }
 
 // get_git_branch 已移除（2026-09-11）—— 由 git-viewer 插件面板提供分支信息

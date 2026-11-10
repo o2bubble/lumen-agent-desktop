@@ -522,7 +522,9 @@ function _FileTree({ rootPath, showHidden, onOpenFile, forceRefresh, revealPath,
     } else if (e.key === "F2" && selectedPath) {
       e.preventDefault();
       // Find the DirNode for selectedPath and trigger rename — skip for now
-    } else if (e.key === "Delete") {
+    } else if (e.key === "Delete" || (isMac && e.key === "Backspace" && e.metaKey)) {
+      // Windows 的 Delete 键在 mac 笔记本上不存在（那颗键发的是 Backspace），
+      // mac 惯例是 ⌘⌫。两种都认，避免 mac 用户没有任何键盘删除入口。
       e.preventDefault();
       setDeleteTarget({ path: selectedPath, name: selectedPath.split(/[/\\]/).pop() || selectedPath });
     } else if (matchesEvent(e, entryKeysOf("files.paste", shortcuts), isMac)) {

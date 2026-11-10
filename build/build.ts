@@ -26,7 +26,7 @@ import { spawnSync } from 'bun'
 import { existsSync, copyFileSync, mkdirSync, cpSync, writeFileSync, readdirSync, statSync, rmSync, readFileSync } from 'fs'
 import { join, resolve, dirname } from 'path'
 import { homedir } from 'os'
-import { type Platform } from './componentPlan'
+import { type Platform, KNOWN_COMPONENTS } from './componentPlan'
 import { generateRelease } from './engine'
 
 const ROOT = resolve(import.meta.dir, '..')
@@ -105,14 +105,18 @@ async function main() {
   // Known components: gui, claude, bun, updater (exe) + tools, python, git, extensions (dir).
   // --components <a,b,c> 只重建/重打这些组件，其余复用上一版本组件 zip 与现有 dist 产物。
   // 无 --components（且无 -only 旗标）时 = 全量构建，行为不变。
-  const KNOWN_COMPONENTS = ['gui', 'server', 'bun', 'updater', 'tools', 'python', 'git', 'extensions']
+  // 组件清单的**唯一真相源**在 componentPlan.ts。这里曾另存一份、漏了 `claude`，
+  // 于是 `--components claude` 会打印「未知组件」再照常构建 —— 一半真一半假，
+  // 看日志的人无法判断到底建了什么。
   const COMPONENTS_IDX = process.argv.indexOf('--components')
   const COMPONENTS_ARG = COMPONENTS_IDX >= 0 ? process.argv[COMPONENTS_IDX + 1] : null
   let COMPONENT_SET: Set<string> | null = null
   if (COMPONENTS_ARG) {
     COMPONENT_SET = new Set(COMPONENTS_ARG.split(',').map((s) => s.trim()).filter(Boolean))
     for (const c of COMPONENT_SET) {
-      if (!KNOWN_COMPONENTS.includes(c)) {
+      // 元组类型是字面量联合，includes 只接受那些字面量 —— 这里输入是用户给的
+      // 任意字符串，先放宽成 string[] 再查。
+      if (!(KNOWN_COMPONENTS as readonly string[]).includes(c)) {
         console.warn(`  [Warn] Unknown component "${c}" — known: ${KNOWN_COMPONENTS.join(', ')}`)
       }
     }

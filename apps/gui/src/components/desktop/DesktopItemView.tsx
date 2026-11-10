@@ -49,8 +49,9 @@ export const DesktopItemView = memo(function DesktopItemView({ item, scale, conn
       if (suppressOwnDrag) return;
       if (e.button !== 0) return;
       e.stopPropagation();
-      // Select this item (Ctrl+click for multi-select, otherwise single)
-      if (e.ctrlKey) {
+      // Select this item (Ctrl/Cmd+click for multi-select, otherwise single)。
+      // mac 上 Ctrl+click 是**右键**，多选必须认 metaKey。
+      if (e.ctrlKey || e.metaKey) {
         const sel = getSelectedIds();
         const next = new Set(sel);
         if (next.has(item.id)) next.delete(item.id); else next.add(item.id);

@@ -523,7 +523,9 @@ export function InputArea({ onSend, onInterrupt, streaming, topSlot, rightSlot, 
           handleSend();
         }
       } else {
-        if (e.key === "Enter" && e.ctrlKey) {
+        // mac 的惯例是 ⌘↩；Ctrl+Enter 在 mac 上不常用，但两者取并集不影响
+        // Windows —— 用户在哪个平台都按得出来。
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
           e.preventDefault();
           handleSend();
         }

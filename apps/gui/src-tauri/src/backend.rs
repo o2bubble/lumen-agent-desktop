@@ -33,17 +33,14 @@ pub fn parse_port_line(line: &str) -> Option<u16> {
 /// Kill the process tree + reap the Child handle. Prefer the registered PID —
 /// it covers backends that hung before the Child handle was stored.
 pub fn kill(state: &mut BackendState) {
-    // Windows 需要进程树击杀（PID 注册兜底挂起后端）；mac/Linux 直接 kill 子进程即可
-    #[cfg(target_os = "windows")]
-    {
-        let pid = state.backend_pid.take().or_else(|| state.process.as_ref().map(|c| c.id()));
-        if let Some(p) = pid {
-            log::info!("Killing IDE backend process tree (PID={})", p);
-            // Native in-proc tree-kill — spawning `taskkill` pops "0xc0000142 /
-            // DLL init failed" when launched at early logon or during shutdown
-            // under a restricted token, and flashes a console.
-            crate::prockill::kill_process_tree(p);
-        }
+    // 进程树击杀：`claude-ide` 会再 spawn `claude`，只杀直接子进程会留下孤儿
+    // （mac 上尤其明显：父进程一死，孙进程被 init 收养后用户无法再找到它）。
+    let pid = state.backend_pid.take().or_else(|| state.process.as_ref().map(|c| c.id()));
+    if let Some(p) = pid {
+        log::info!("Killing IDE backend process tree (PID={})", p);
+        // Windows：原生 in-proc 树杀，不 spawn `taskkill`
+        // （早登录 / 关机会因受限令牌弹出 0xc0000142，还会闪控制台）。
+        crate::kill_process_tree(p);
     }
     if let Some(ref mut child) = state.process {
         let _ = child.kill();
@@ -93,8 +90,7 @@ where
     }
 
     // Timed out — kill the tree so no orphan survives.
-    #[cfg(target_os = "windows")]
-    crate::prockill::kill_process_tree(child.id());
+    crate::kill_process_tree(child.id());
     let _ = child.kill();
     let _ = child.wait();
     Err("IDE backend did not announce port within timeout".to_string())

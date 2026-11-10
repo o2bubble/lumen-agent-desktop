@@ -363,11 +363,20 @@ fn expand_env_vars(p: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     result
 }
 
-/// PATH 中的某个条目是否存在（大小写不敏感、忽略尾部反斜杠、按 ';' 分隔）。
+/// PATH 中的某个条目是否存在。
+///
+/// 分隔符与大小写都跟平台走：mac/Linux 是 `:` 且按原样比较；Windows 保持
+/// `;` + 大小写不敏感。写死 `;` 会让 mac 上整条 PATH 被当成**一个**条目，
+/// 所有「PATH 里有没有安装目录」的检查都恒为 false。
 fn path_has(path: &str, entry: &str) -> bool {
-    let entry = entry.trim_end_matches('\\').to_lowercase();
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let norm = |s: &str| -> String {
+        let s = s.trim_end_matches(['\\', '/']);
+        if cfg!(windows) { s.to_lowercase() } else { s.to_string() }
+    };
+    let entry = norm(entry);
     if entry.is_empty() { return false; }
-    path.split(';').any(|p| p.trim_end_matches('\\').to_lowercase() == entry)
+    path.split(sep).any(|p| norm(p) == entry)
 }
 
 // ── 采集编排 ──
@@ -494,8 +503,11 @@ fn install_env_checks(install_dir: &std::path::Path) -> Vec<DiagnosticCheck> {
     let bash_check = check_bash_resolution(first_bash_in_path(&proc_path).as_deref(), &our_bash_dirs)
         .with_group(GROUP_INSTALL_ENV);
 
-    // 安装目录组件
+    // 安装目录组件（mac 的 GUI 二进制没有 .exe 后缀，且在 .app/Contents/MacOS 下）
+    #[cfg(windows)]
     let has_root = install_dir.join("claude-code-gui.exe").is_file() || install_dir.join("claude.exe").is_file();
+    #[cfg(not(windows))]
+    let has_root = install_dir.join("claude-code-gui").is_file();
     let has_bin = install_dir.join("bin").is_dir();
     let has_python = install_dir.join("python").is_dir();
     let has_git = install_dir.join("git").is_dir();
@@ -2202,7 +2214,13 @@ fn plan_var_fix(
 
 /// 需要补进 PATH 的安装目录子路径（相对安装根）。目录存在才补；
 /// 覆盖 git（usr/bin 供 bash、bin 供 git 可执行）与 python（解释器 + pip 脚本）。
+#[cfg(windows)]
 const PATH_SUFFIXES: &[&str] = &["", "\\bin", "\\git\\usr\\bin", "\\git\\bin", "\\python", "\\python\\Scripts"];
+
+/// mac：安装后的目录布局只有安装根 + bin（rg/fd/jq/yq/shellcheck 与内置 bun）。
+/// python / git 在 mac 上不打包（系统自带或由用户装）。
+#[cfg(not(windows))]
+const PATH_SUFFIXES: &[&str] = &["", "/bin"];
 
 /// 系统 PATH 精简（纯函数，可单测）：删除冗余 claude 子目录条目，只保留
 /// %CLAUDE_CODE_HAHA_HOME%（根）与 %CLAUDE_CODE_HAHA_HOME%\git\usr\bin。

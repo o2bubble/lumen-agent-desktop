@@ -59,7 +59,7 @@
 
   /* 字体 */
   --font-sans: "Segoe UI", system-ui, -apple-system, sans-serif;
-  --font-mono: "Cascadia Code", "Fira Code", "Consolas", monospace;
+  --font-mono: "Cascadia Code", "Fira Code", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 
   /* 过渡 */
   --transition-fast: 0.1s ease;
@@ -305,7 +305,7 @@ body {
   overflow-x: auto;
 }
 .md-body code {
-  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
   overflow-wrap: anywhere;
   word-break: break-all;
 }
@@ -371,7 +371,7 @@ body {
 }
 .md-notes strong { color: var(--fg-primary); font-weight: 600; }
 .md-notes code {
-  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
   background: var(--bg-code);
   padding: 0 3px;
   border-radius: 3px;

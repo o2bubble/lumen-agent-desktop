@@ -21,3 +21,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
 ] }
+
+# macOS 取进程启动时刻要走 libproc（proc_pidinfo）。没有它，非 Windows 分支
+# 只能返回 None → 判活一律为假（见 instances.rs 里那段说明的后果）。
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

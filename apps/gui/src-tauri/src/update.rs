@@ -167,6 +167,23 @@ fn try_install(temp_dir: &std::path::Path, dst: &std::path::Path, _install_dir: 
 }
 
 /// Find the first regular file walking a directory tree.
+/// 在解压目录里按**文件名**找（不取第一个普通文件）。
+fn walkdir_find_named(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walkdir_find_named(&path, name) {
+                    return Some(found);
+                }
+            } else if path.is_file() && path.file_name().and_then(|s| s.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn walkdir_find_first_file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -328,6 +345,24 @@ fn install_via_stager(
     Ok(())
 }
 
+/// POSIX 单引号引用：`'` → `'\''`，**其余字符原样**。
+///
+/// 单引号里反斜杠和双引号都是字面量，不能像双引号那样转义 —— 旧实现把
+/// `\` 换成 `\\`、`"` 换成 `\"`，路径里真有这些字符时反而被改写。
+#[cfg(not(windows))]
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// AppleScript 双引号字符串转义：`\` → `\\`、`"` → `\"`。
+///
+/// 顺序不能反：先转义反斜杠再转义引号，否则引号前那个新加的反斜杠会被
+/// 再转义一次。
+#[cfg(not(windows))]
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', r"\\").replace('"', "\\\"")
+}
+
 /// macOS 提权安装：无 Update.exe stager，用 osascript `do shell script … with
 /// administrator privileges` 弹系统授权框，以 ditto 复制组件到位。
 /// claude 是单文件二进制（temp 里第一个文件）；extensions 是目录（temp 整体复制）。
@@ -339,21 +374,24 @@ fn install_via_elevated_mac(
     new_sha256: Option<&str>,
     new_size: Option<u64>,
 ) -> Result<(), String> {
-    // AppleScript 字符串字面量转义：`"` → `\"`、`\` → `\\`（路径里单引号罕见，用 ' 包裹）。
-    fn esc(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    }
     let src: std::path::PathBuf = match component_name {
-        "claude" => walkdir_find_first_file(temp_dir)
-            .ok_or_else(|| format!("No file found in {}", temp_dir.display()))?,
+        // 单文件组件：按**名字**找，不能取「第一个普通文件」—— zip 里往往还有
+        // 许可证、manifest 之类，解压顺序不保证，取第一个等于随机挑一个文件
+        // 覆盖到 `Contents/MacOS/claude`（真踩：更新后 claude 起不来）。
+        "claude" | "bun" => walkdir_find_named(temp_dir, component_name).ok_or_else(|| {
+            format!("在 {} 里找不到名为 {} 的文件", temp_dir.display(), component_name)
+        })?,
         _ => temp_dir.to_path_buf(),
     };
     let sh = format!(
-        "ditto '{}' '{}'",
-        esc(&src.to_string_lossy()),
-        esc(&dst.to_string_lossy())
+        "ditto {} {}",
+        sh_squote(&src.to_string_lossy()),
+        sh_squote(&dst.to_string_lossy())
     );
-    let script = format!("do shell script \"{}\" with administrator privileges", sh);
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        applescript_escape(&sh)
+    );
     let status = std::process::Command::new("osascript")
         .arg("-e")
         .arg(&script)
@@ -371,10 +409,20 @@ fn install_via_elevated_mac(
     Ok(())
 }
 
+/// macOS：没有 Update.exe 提权通道，也没有「注册表环境变量」这个概念。
+/// 直接给一句说得清的话，而不是让用户看到 "Update.exe not found"。
+#[cfg(not(windows))]
+pub fn run_env_ops_elevated(_ops: Vec<crate::diagnostics::EnvOp>) -> Result<(), String> {
+    Err("macOS 不需要环境变量修复：GUI 启动时自己设置 PATH 与 \
+         CLAUDE_CODE_HAHA_HOME，不写系统级配置"
+        .to_string())
+}
+
 /// 提权执行环境变量修复（更新改 HKLM + 清理 HKCU）。
 /// 复用 claude-update.json + Update.exe RunAs（其环境变量 ops 在 updater 内单独执行，
 /// 不触碰 GUI 进程）。gui_exe_src 留空 → Update.exe 不 taskkill / 不重启 GUI。
 /// UAC 被拒/取消 → PowerShell Start-Process -Verb RunAs 返回非 0 → 报错。
+#[cfg(windows)]
 pub fn run_env_ops_elevated(ops: Vec<crate::diagnostics::EnvOp>) -> Result<(), String> {
     use serde_json::json;
 
@@ -397,7 +445,6 @@ pub fn run_env_ops_elevated(ops: Vec<crate::diagnostics::EnvOp>) -> Result<(), S
         .map_err(|e| format!("Cannot write update instructions: {}", e))?;
 
     // Launch Update.exe — its embedded manifest triggers UAC elevation
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -416,12 +463,6 @@ pub fn run_env_ops_elevated(ops: Vec<crate::diagnostics::EnvOp>) -> Result<(), S
         if !status.success() {
             return Err("环境变量修复需系统级权限，但授权被取消或失败(UAC 拒绝)".to_string());
         }
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new(&updater_path)
-            .spawn()
-            .map_err(|e| format!("Cannot launch updater: {}", e))?;
     }
 
     Ok(())
@@ -915,14 +956,15 @@ fn prepare_gui_update_mac(
     let dst = component_artifact_path(&install_dir, "gui", platform_str())
         .ok_or("Cannot resolve macOS .app path for update")?;
 
-    fn esc(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    }
+    let sh = format!(
+        "rm -rf {}; ditto {} {}",
+        sh_squote(&dst.to_string_lossy()),
+        sh_squote(&app_bundle.to_string_lossy()),
+        sh_squote(&dst.to_string_lossy())
+    );
     let script = format!(
-        "do shell script \"rm -rf '{}'; ditto '{}' '{}'\" with administrator privileges",
-        esc(&dst.to_string_lossy()),
-        esc(&app_bundle.to_string_lossy()),
-        esc(&dst.to_string_lossy())
+        "do shell script \"{}\" with administrator privileges",
+        applescript_escape(&sh)
     );
     let status = Command::new("osascript")
         .arg("-e")
@@ -1016,8 +1058,56 @@ pub fn launch_updater_and_exit(app: tauri::AppHandle, updater_path: String) -> R
     #[cfg(not(windows))]
     {
         if updater_path.is_empty() {
-            // macOS：.app 已由 prepare_gui_update 替换，直接退出让用户重启新版本。
-            log::info!("macOS GUI replaced — exiting for restart");
+            // macOS：.app 已由 prepare_gui_update_mac 换掉。但「换掉文件」不等于
+            // 「新版本跑起来」——下面三件事都必须做，否则用户看到的是旧代码：
+            //
+            // ① server（`claude-gui-server`）是独立常驻进程，不随 GUI 退出。
+            //    不杀它就会带着旧代码继续跑（Windows 侧 2026-10-27 踩过：升级后
+            //    托盘菜单还是旧的，用户以为升级没生效）。
+            // ② 其它 GUI 实例：内存里仍是旧版本，且会继续写实例自述。
+            // ③ 插件后台进程：exit(0) 绕过 RunEvent::Exit，不清理会留孤儿
+            //    （cwd 钉在插件目录 → 卸载报 os error 32）。
+            let _ = std::process::Command::new("pkill")
+                .args(["-x", "claude-gui-server"])
+                .status();
+
+            crate::plugin_process::kill_all_plugin_processes();
+
+            let self_pid = std::process::id();
+            if let Ok(dir) = app.path().app_data_dir() {
+                for rec in crate::instances::collect_live_instances(
+                    &dir,
+                    crate::instances::is_instance_alive,
+                ) {
+                    if rec.pid != self_pid {
+                        // 与 plugin_process 一致：不引入 libc，直接调 kill(1)
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &rec.pid.to_string()])
+                            .status();
+                    }
+                }
+                crate::instances::clear_instance_records(&dir);
+            }
+
+            // 重新拉起新版本（`open -n` 走 LaunchServices，与「新建窗口」同一条路）。
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(app_root) = exe
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                {
+                    match std::process::Command::new("open")
+                        .arg("-n")
+                        .arg(app_root)
+                        .spawn()
+                    {
+                        Ok(_) => log::info!("macOS GUI replaced — relaunched"),
+                        Err(e) => log::error!(
+                            "macOS GUI replaced but relaunch failed ({e}) — user must open it manually"
+                        ),
+                    }
+                }
+            }
         } else {
             let _ = std::process::Command::new(&updater_path).status();
         }

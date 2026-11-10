@@ -218,8 +218,7 @@ pub fn spawn_plugin_process(
         // 等待进程退出(maintenance/崩溃监控)。
         // 超时未报告端口时先杀(否则 wait 会阻塞到进程自己退出 → 永久挂住线程)。
         if !found_port {
-            #[cfg(target_os = "windows")]
-            crate::prockill::kill_process_tree(pid);
+            crate::kill_process_tree(pid);
         }
         let _ = child.wait();
         // ⚠️ kill/wait 竞态防护: wait 返回时(1)可能是用户 kill(状态已被置 killed),
@@ -239,8 +238,7 @@ pub fn spawn_plugin_process(
         registry().pids.lock().unwrap().remove(&pid_str);
         if !found_port {
             // 超时未报告端口 → 杀进程 + error(之前 break 未杀)。
-            #[cfg(target_os = "windows")]
-            crate::prockill::kill_process_tree(pid);
+            crate::kill_process_tree(pid);
             set_status(&pid_str, "error");
             emit_status(&app, &pid_str, "error", None, Some(pid), Some("进程未在超时内报告端口, 已终止".to_string()));
         } else {
@@ -256,15 +254,9 @@ pub fn spawn_plugin_process(
 pub fn kill_plugin_process(app: &AppHandle, process_id: &str) -> bool {
     let pid = registry().pids.lock().unwrap().get(process_id).copied();
     if let Some(p) = pid {
-        #[cfg(target_os = "windows")]
-        crate::prockill::kill_process_tree(p);
-        #[cfg(not(target_os = "windows"))]
-        {
-            // 非 Windows(mac/Linux): 用系统 kill 命令送 SIGTERM(避免 libc 依赖)。
-            if let Ok(mut k) = std::process::Command::new("kill").arg(p.to_string()).spawn() {
-                let _ = k.wait();
-            }
-        }
+        // 统一走平台无关的树杀：mac 上只 kill 直接子进程会留下孤儿
+        // （node 再 spawn 的孙进程被 init 收养，用户杀不掉）。
+        crate::kill_process_tree(p);
     }
     registry().pids.lock().unwrap().remove(process_id);
     set_status(process_id, "killed");
@@ -304,14 +296,7 @@ pub fn forget_plugin_processes(app: &AppHandle, process_ids: &[String]) {
 pub fn kill_all_plugin_processes() {
     let pids: Vec<u32> = registry().pids.lock().unwrap().values().copied().collect();
     for pid in pids {
-        #[cfg(target_os = "windows")]
-        crate::prockill::kill_process_tree(pid);
-        #[cfg(not(target_os = "windows"))]
-        {
-            if let Ok(mut k) = std::process::Command::new("kill").arg(pid.to_string()).spawn() {
-                let _ = k.wait();
-            }
-        }
+        crate::kill_process_tree(pid);
     }
     registry().pids.lock().unwrap().clear();
 }

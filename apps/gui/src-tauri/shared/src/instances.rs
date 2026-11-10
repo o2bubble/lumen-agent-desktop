@@ -62,19 +62,42 @@ pub struct InstanceRecord {
 /// 不会崩。改 identifier 时记得同步这里。
 pub const APP_BUNDLE_ID: &str = "com.claudecode.gui";
 
-/// `<数据目录>/<bundle id>`，等价于 Tauri 的 `app.path().app_data_dir()`。
+/// `<数据目录>/<bundle id>`，**必须与 Tauri 的 `app.path().app_data_dir()` 同值**。
+///
+/// 这是硬不变量，不是「差不多就行」：同一个功能的两个入口常分别用这两条路径 ——
+/// 早期认领（没有 AppHandle，只能用这里）和 setup/写实例自述（用 Tauri 的）。
+/// 一旦分叉，两边看到的就不是同一批文件：
+///   · `~/.config/com.claudecode.gui` vs `~/Library/Application Support/...`
+///   · 清理工具读不到别的实例 → 把别人正在用的工作区当成可清理目标
+///   · server 读不到实例 → 托盘菜单永远是空的
 pub fn app_data_dir_early() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
+        // Tauri: %APPDATA%\<identifier>
         std::env::var("APPDATA")
             .ok()
             .map(|p| PathBuf::from(p).join(APP_BUNDLE_ID))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        std::env::var("HOME")
+        // Tauri (dirs::data_dir) → $HOME/Library/Application Support
+        // ⚠️ 不是 ~/.config —— 那是 Linux 的惯例，mac 上 Tauri 不用它。
+        std::env::var("HOME").ok().map(|p| {
+            PathBuf::from(p)
+                .join("Library")
+                .join("Application Support")
+                .join(APP_BUNDLE_ID)
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Tauri (dirs::data_dir) → $XDG_DATA_HOME 或 ~/.local/share
+        std::env::var("XDG_DATA_HOME")
             .ok()
-            .map(|p| PathBuf::from(p).join(".config").join(APP_BUNDLE_ID))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var("HOME").ok().map(|p| PathBuf::from(p).join(".local/share")))
+            .map(|p| p.join(APP_BUNDLE_ID))
     }
 }
 
@@ -201,7 +224,37 @@ pub fn process_start_time_ms(pid: u32) -> Option<u64> {
             raw.checked_sub(EPOCH_DIFF_100NS).map(|v| v / 10_000)
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    // macOS：libproc 的 PROC_PIDTBSDINFO 给出 pbi_start_tvsec/tvusec（微秒级，
+    // 足够区分 pid 复用）。返回的字节数不足 = 进程不存在 / 无权限。
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use std::mem::MaybeUninit;
+
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let n = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr() as *mut libc::c_void,
+            size,
+        );
+        if n < size {
+            return None;
+        }
+        let info = info.assume_init();
+        // SZOMB = 5：已退出但父进程还没回收。pid 仍占着，但对「这个实例还活着吗」
+        // 来说它就是死的 —— 与 Windows 分支排除非 STILL_ACTIVE 是同一个判据。
+        const SZOMB: u32 = 5;
+        if info.pbi_status == SZOMB {
+            return None;
+        }
+        Some(info.pbi_start_tvsec * 1000 + info.pbi_start_tvusec / 1000)
+    }
+
+    // 其它平台（Linux）暂不支持：返回 None 与旧行为一致，调用方退化为「当死」。
+    // 宁可多恢复一次，也不要把已死的进程当成活着。
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         None
     }

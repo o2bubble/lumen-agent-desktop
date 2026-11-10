@@ -79,6 +79,7 @@ name = "claude-gui-shared"
 version = "0.1.0"
 dependencies = [
  "jieba-rs",
+ "libc",
  "log",
  "rusqlite",
  "serde",
