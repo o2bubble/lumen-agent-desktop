@@ -12,6 +12,11 @@ name: macOS Build
 #    macos-14 / macos-15 = Apple Silicon；macos-13 = Intel；macos-latest 不保证，
 #    故**显式钉版本**，且加一步架构自检。
 #
+#    **2026-11-10 实测**：本仓用 `macos-14` 时 job 直接 cancelled，注解是
+#      `The configuration 'macos-14-arm64-us-default' is not supported`
+#    （同一个 label 在 CLI 仓 11-03 还能跑）。改 `macos-15` 立即可用 ——
+#    两个都是 arm64，任选其一失败时换另一个。
+#
 # ⚠️ 本仓库是 **public** —— Actions 日志与 artifact 对所有人可见/可下载，
 #    即 mac 安装包（含完整 .app）会公开。构建只用公开 URL，无凭据泄露面。
 #

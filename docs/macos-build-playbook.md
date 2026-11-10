@@ -70,7 +70,7 @@
 需要时按 `.github/workflows/macos-build.yml` 的步骤重建）。
 
 **GitHub Actions 的三个硬约束**（都写进了 `.github/workflows/macos-build.yml`）：
-- **必须 arm64 runner**（用 `macos-14`，**不要改 `macos-13`/`macos-latest`**）——
+- **必须 arm64 runner**（用 `macos-15`，**不要改 `macos-13`/`macos-latest`**）——
   build.ts 全链路硬编码 aarch64，落到 x86_64 runner 会编出 x86_64 的 `.app`。
   workflow 里有「Verify arm64 runner」自检步兜底。
 - 本仓库是 **public** → Actions **日志与 artifact 对所有人可见/可下载**。
