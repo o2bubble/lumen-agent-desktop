@@ -65,21 +65,26 @@ describe("registerPluginPanels — 注册进 panelRegistry", () => {
   });
 });
 
-// ── GV-T1 平台协议 URL（2026-09-09 用户实测: plugins:// 在 Windows 被沙箱拦截）──
+// ── 插件 iframe URL 形态 ──
+//
+// 2026-09-09：Windows 实测 `plugins://` 被 WebView2 当外部协议导航拦掉 → 改 http。
+// 2026-11-10：Mac 实测 iframe 建起来但内容空白 —— `plugins://` 源下 iframe 内部
+//   fetch http://127.0.0.1:<port> 的跨源请求被 WebKit 拦（服务端 CORS 已放行 *）。
+//   → 全平台统一 http 形式，不再按平台分叉。
 
-describe("pluginIframeBase — 平台正确的协议 URL", () => {
-  it("windows → http://plugins.localhost/... (WebView2 沙箱拦 plugins://)", () => {
+describe("pluginIframeBase — 全平台统一 http 形式", () => {
+  it("windows → http://plugins.localhost/...", () => {
     expect(pluginIframeBase("git-viewer", "panel.html", "windows"))
       .toBe("http://plugins.localhost/git-viewer/panel.html");
   });
-  it("mac/linux → plugins://localhost/...", () => {
+  it("macos/linux 也用 http（原先 plugins:// 在 WebKit 下跨源被拦）", () => {
     expect(pluginIframeBase("git-viewer", "panel.html", "macos"))
-      .toBe("plugins://localhost/git-viewer/panel.html");
+      .toBe("http://plugins.localhost/git-viewer/panel.html");
     expect(pluginIframeBase("git-viewer", "panel.html", "linux"))
-      .toBe("plugins://localhost/git-viewer/panel.html");
+      .toBe("http://plugins.localhost/git-viewer/panel.html");
   });
-  it("null (platform 未就绪) → 非 windows 形式", () => {
-    expect(pluginIframeBase("g", "p.html", null)).toBe("plugins://localhost/g/p.html");
+  it("platform 未就绪（null）时同样给 http，不等到平台探测完成", () => {
+    expect(pluginIframeBase("g", "p.html", null)).toBe("http://plugins.localhost/g/p.html");
   });
 });
 

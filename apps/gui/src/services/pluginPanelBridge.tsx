@@ -24,17 +24,26 @@ function useGuiPlatform(): GuiPlatform | null {
 }
 
 /** 平台正确的插件 iframe base URL（无端口 query）。导出供单测锁定回归。
- *  Windows: http://plugins.localhost/...  —— 直接 plugins:// 会被 WebView2
- *   当外部协议导航被 iframe 沙箱拦截（用户实测错误: "Navigation to external protocol
- *   blocked by sandbox ... allow-top-navigation-to-custom-protocols"）。用 http 是
- *   tauri use_https_scheme 默认 false（tauri.conf 未设）—— 且 http 页面 fetch
- *   http://127.0.0.1 无 mixed-content 问题。
- *  其它(mac/Linux): plugins://localhost/...。 */
-export function pluginIframeBase(pluginName: string, src: string, platform: GuiPlatform | null): string {
-  if (platform === "windows") {
-    return `http://plugins.localhost/${pluginName}/${src}`;
-  }
-  return `plugins://localhost/${pluginName}/${src}`;
+ *
+ * **全部平台统一 `http://plugins.localhost/...`**（2026-11-10 起）。
+ *
+ * 历史：Windows 一开始就得用 http 形式 —— WebView2 会把 `plugins://` 当外部协议
+ * 导航拦掉（`Navigation to external protocol blocked by sandbox ...
+ * allow-top-navigation-to-custom-protocols`）。mac/Linux 那条 `plugins://localhost`
+ * 分支**从未真机验证**。
+ *
+ * 2026-11-10 首次在 Mac 上实测 office-preview：iframe 建起来了（DOM 里有、src 对、
+ * 参数传到了），但内容空白。`plugins://` 源下 iframe 内部再 fetch
+ * `http://127.0.0.1:<port>/file` 的跨源请求被 WebKit 拦掉 —— 服务端已发
+ * `Access-Control-Allow-Origin: *`，所以不是服务端的问题。
+ *
+ * 统一 http 后：iframe 源是普通 http origin，跨源到 127.0.0.1 是标准场景，两个
+ * 内核行为一致。tauri 的 use_https_scheme 默认 false，故是 http 不是 https，
+ * 也就不存在 mixed-content。
+ *
+ * 保留 platform 参数：调用点已在传，将来若某平台必须回退时有地方写。 */
+export function pluginIframeBase(pluginName: string, src: string, _platform: GuiPlatform | null): string {
+  return `http://plugins.localhost/${pluginName}/${src}`;
 }
 
 /** postMessage 来源校验: 仅接受插件面板 iframe 两种平台 origin 形态
