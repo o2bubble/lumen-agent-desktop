@@ -24,6 +24,10 @@ name: macOS Build
 #    o2bubble/claude-code-haha-rush 用 `bun build --compile` 产出，本仓只消费。
 #    所以这里多 checkout 一个公开仓，编好后用 `--claude-from` 传进来。
 #    不传也能构建，但产物**没有聊天后端**（build.ts 会打印一行跳过提示）。
+#
+# ⚠️ **产物未签名、未公证**（阶段 0）。DMG 里有「右键→打开」说明，
+#    用户首次安装需照做。签名/公证的接入点已留好（见
+#    docs/macos-signing-plan.md），补上 secrets 即可启用，不需要改这里。
 on:
   workflow_dispatch:
   push:
@@ -104,6 +108,27 @@ jobs:
           test -x "$APP/claude" || { echo "::error::claude 缺可执行位"; exit 1; }
           echo "组件 zip："
           ls -lh dist/release/ci-build/*.zip
+          echo "DMG："
+          ls -lh dist/release/ci-build/*.dmg
+
+      # DMG 再单独验一次「真的能挂载、里面真的是完整 app」。build.ts 里已经
+      # 跑过 hdiutil verify，这里加一道是因为**挂载后**才能确认 bundle 结构
+      # （软链 Applications、无 ._ 苹果双胞胎文件）。历史教训：zip 里看着对、
+      # 装完起不来，问题都出在打包而非编译。
+      - name: Verify DMG mounts
+        run: |
+          set -e
+          DMG=$(ls dist/release/ci-build/*.dmg | head -1)
+          MNT=$(mktemp -d)
+          hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -quiet
+          trap 'hdiutil detach "$MNT" -quiet || true; rmdir "$MNT" || true' EXIT
+          test -L "$MNT/Applications" || { echo "::error::DMG 里缺 Applications 软链（无法拖拽安装）"; exit 1; }
+          test -d "$MNT/Claude Code.app" || { echo "::error::DMG 里缺 .app"; exit 1; }
+          test -x "$MNT/Claude Code.app/Contents/MacOS/claude" || { echo "::error::DMG 内 claude 不可执行"; exit 1; }
+          # python 的 symlink 必须活着（cp -R 而非 ditto 会把它变成普通文件）
+          test -L "$MNT/Claude Code.app/Contents/MacOS/python/bin/python3" \
+            || { echo "::error::python 的 symlink 丢了（打包方式错了？）"; exit 1; }
+          echo "DMG 结构与可执行位 OK"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -114,5 +139,6 @@ jobs:
           path: |
             dist/release/ci-build/manifest.json
             dist/release/ci-build/*.zip
+            dist/release/ci-build/*.dmg
           if-no-files-found: error
           retention-days: 14

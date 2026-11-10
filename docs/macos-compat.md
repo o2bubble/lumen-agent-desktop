@@ -33,7 +33,7 @@
 |---|---|---|
 | **菜单栏托盘** | **没有**。`server/src/tray.rs` 的 `spawn()` 在非 Windows 直接返回 `None` | mac 的状态栏项必须在主线程 + NSApplication 事件循环里创建，而 server 是 tokio 程序、没有 AppKit 主循环。要做得单开（换 Tauri 内建 tray 或给 server 起 AppKit loop）。**mac 用户目前只能通过 Dock 切换/退出。** |
 | 自启动 | 没有实现（Windows 也没有） | 要做得用 `SMAppService`（macOS 13+）或 LaunchAgent |
-| `.dmg` / 公证 | 没有 | 分发是 zip；未签名未公证，用户首次需右键打开或 `xattr -cr`（见 playbook §0） |
+| 公证 / 签名 | 没有 | **阶段 0**：DMG 已能产出（`scripts/macos/build-dmg.sh`），但未签名未公证，用户首次需「右键 → 打开」。接入方案与费用见 `macos-signing-plan.md` |
 | Intel mac | 不支持 | 全链路硬编码 aarch64 |
 | 进程树击杀的**极端**情况 | mac 用 `pkill -P` + SIGTERM→1s→SIGKILL | 不是真正的进程组语义；如果子进程自己再 detach（`setsid`），还是会漏。Windows 侧是 Win32 原生树杀 |
 

@@ -11,6 +11,9 @@
 >
 > **功能层面的 mac 差异见 `docs/macos-compat.md`**（哪些平台分支是桩、哪些
 > 还没做、真机必验哪几条）。本文件只管「怎么打包」。
+>
+> **签名/公证还没接**（阶段 0）：产物是未签名的 DMG，用户首次需「右键 → 打开」。
+> 接入方案、费用、三层 entitlements 见 `docs/macos-signing-plan.md`。
 
 ## 0. 架构决策速查
 
@@ -210,8 +213,17 @@ error[E0599]: no method named `transparent` found for struct `WebviewWindowBuild
 
 ## 2. 产物下载与验证
 
-从构建页下载 artifacts —— **Codemagic**：构建页 artifacts 区；**GitHub Actions**：仓库
-Actions 页 → 对应 run → 底部 artifact「lumen-agent-desktop-macos」（zip 内含全部组件）。
+从构建页下载 artifacts —— **GitHub Actions**：仓库 Actions 页 → 对应 run →
+底部 artifact「lumen-agent-desktop-macos」，里面有两类东西：
+
+| 产物 | 用途 |
+|---|---|
+| `lumen-agent-desktop.dmg` | **给人装的**：拖进「应用程序」。未签名时镜像里自带「首次打开」说明 |
+| `*.zip` + `manifest.json` | 更新服务器用（组件级增量更新），不是给人装的 |
+
+`--release <ver>` 时 build.ts 会在 embed 之后自动调用
+`scripts/macos/build-dmg.sh`（第 12 步）。**不要**改成 `cargo tauri build --bundles dmg`：
+Tauri 的 dmg bundler 靠 AppleScript 在 Finder 里摆图标，无头 CI 上经常挂到超时。
 
 **必须用 build.ts 打的 zip**（`gui.zip` 等），**不要用平台自动打的 `Claude_Code.app.zip`**
 或 `dist/Claude Code.app` 那棵树（自动打包不保留 symlink，装完起不来，见踩坑）。

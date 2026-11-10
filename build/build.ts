@@ -160,7 +160,8 @@ async function main() {
     }
   }
 
-  const TOTAL_STEPS = RELEASE_VER ? 11 : 10
+  // mac 的 release 多一步 DMG（见第 12 步）
+  const TOTAL_STEPS = RELEASE_VER ? (PLATFORM === 'macos' ? 12 : 11) : 10
 
   function step(n: number) {
     return `[${n}/${TOTAL_STEPS}]`
@@ -909,6 +910,35 @@ async function main() {
   })
   } // end --release block
 
+  // 12. macOS: 打 DMG（拖进「应用程序」即安装）
+  //
+  // 必须放在 embed **之后**（generateRelease 里通过 beforeManifest 调用了
+  // embedIntoAppBundle）——在那之前 .app 里还没有 claude / python / 工具链。
+  // 脚本自己也会校验核心组件存在，打空壳会直接失败而不是产出一个
+  // 「能装、但用不了」的镜像。
+  if (PLATFORM === 'macos' && RELEASE_VER) {
+    console.log(`${step(12)} Creating DMG...`)
+    const dmgOut = join(DIST, 'release', RELEASE_VER, 'lumen-agent-desktop.dmg')
+    const args = [
+      'bash', join(ROOT, 'scripts', 'macos', 'build-dmg.sh'),
+      '--app', join(DIST, 'Claude Code.app'),
+      '--out', dmgOut,
+    ]
+    // 未签名 / 未公证时 Gatekeeper 会拦；镜像里放一张「右键→打开」说明。
+    // 签名接上之后（阶段 1）这里会自动不加，不需要改调用方。
+    if (!process.env.APPLE_SIGNING_IDENTITY && !process.env.APPLE_CERTIFICATE) {
+      args.push('--first-run-note')
+    }
+    const r = spawnSync(args, { cwd: ROOT, timeout: 900000 })
+    if (r.exitCode !== 0) {
+      console.error('[Error] DMG 失败:', (r.stderr ?? '').toString())
+      process.exit(1)
+    }
+    // 转发脚本输出（它会打印 staging / verify / 最终大小）
+    const out = (r.stdout ?? '').toString().trimEnd()
+    if (out) console.log(out.split('\n').map((l) => '  ' + l).join('\n'))
+  } // end macOS DMG
+
   // Summary
   let totalSize = 0
   function calcSize(dir: string) {
@@ -927,13 +957,23 @@ async function main() {
   console.log('  Build complete!')
   console.log(`  Total size: ~${sizeMB} MB`)
   console.log()
-  console.log(`  dist/*.exe                   — claude-code-gui.exe, claude.exe, Update.exe, bun.exe`)
-  console.log(`  dist/*.cmd                   — Launcher scripts`)
-  console.log(`  dist/bin/                    — CLI tools (rg, fd, jq, yq, shellcheck)`)
-  console.log(`  dist/python/                 — Python 3.12 (full) + pywin32`)
-  console.log(`  dist/git/                    — Git Bash + Git repo tools`)
-  console.log(`  dist/extensions/             — IDE plugins (VS Code, VS, IntelliJ, CDP) + COM bridge`)
-  if (RELEASE_VER) console.log(`  dist/release/${RELEASE_VER}/    — Update manifest + component zips`)
+  // 按平台列产物。以前这里写死了 Windows 的全部条目（.exe/.cmd/git/python+pywin32），
+  // mac 构建也会照打一遍 —— CI 排障时看到「dist/*.exe」会以为构建没走 mac 分支。
+  if (PLATFORM === 'windows') {
+    console.log(`  dist/*.exe                   — claude-code-gui.exe, claude.exe, Update.exe, bun.exe`)
+    console.log(`  dist/*.cmd                   — Launcher scripts`)
+    console.log(`  dist/bin/                    — CLI tools (rg, fd, jq, yq, shellcheck)`)
+    console.log(`  dist/python/                 — Python 3.12 (full) + pywin32`)
+    console.log(`  dist/git/                    — Git Bash + Git repo tools`)
+    console.log(`  dist/extensions/             — IDE plugins (VS Code, VS, IntelliJ, CDP) + COM bridge`)
+  } else {
+    console.log(`  dist/Claude Code.app/        — 完整 .app（含 claude / server / python / 工具链 / 扩展）`)
+    console.log(`  dist/bin/                    — CLI tools (rg, fd, jq, yq, shellcheck)`)
+    console.log(`  dist/python/                 — python-build-standalone (aarch64) + mcp`)
+    console.log(`  dist/extensions/             — IDE plugins（git 用系统自带，不打包）`)
+  }
+  if (RELEASE_VER) console.log(`  dist/release/${RELEASE_VER}/    — Update manifest + component zips`
+    + (PLATFORM === 'macos' ? ' + lumen-agent-desktop.dmg' : ''))
   console.log(`  dist/scripts/                — TypeScript tools`)
   console.log('='.repeat(50))
   console.log()
@@ -943,7 +983,7 @@ async function main() {
     const ver = spawnSync([claudeBin, '--version'], { cwd: DIST })
     console.log('  →', ver.stdout.toString().trim())
   } catch {
-    console.log('  [Skip] claude.exe not built yet')
+    console.log('  [Skip] claude 二进制还没有构建')
   }
 }
 
