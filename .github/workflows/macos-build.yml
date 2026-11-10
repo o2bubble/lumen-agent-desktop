@@ -32,7 +32,7 @@ concurrency:
 jobs:
   build:
     # arm64（M1）—— 见文件头，勿改成 macos-13 / macos-latest
-    runs-on: macos-14
+    runs-on: macos-15
     # 完整管线：tauri 首次编译 + 9 个组件（含下载 python / portablegit）
     timeout-minutes: 90
 
