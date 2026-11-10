@@ -6,6 +6,11 @@
 
 **License: [MIT](LICENSE)**
 
+仓库：[GitHub](https://github.com/o2bubble/lumen-agent-desktop) · [Gitee](https://gitee.com/randomlife/lumen-agent-desktop)。
+CLI 引擎（`claude` 二进制）在另一个仓
+[claude-code-haha-rush](https://github.com/o2bubble/claude-code-haha-rush) ——
+**本仓不编译它**，macOS CI 会 checkout 那个仓再用 `--claude-from` 喂进来。
+
 ## 这是什么
 
 Claude Code 本身是一个命令行工具。这个仓库提供一个桌面外壳：把它的能力放进带面板的图形界面里，并补上 CLI 没有的东西 —— 无限画布（超级桌面）、笔记、文件预览、插件市场、GUI 专属 MCP 工具（`deliver` 交付卡片、`desktop_*` 画布操作等）。
