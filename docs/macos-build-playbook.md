@@ -8,6 +8,9 @@
 > 拆仓背景见 `claude-code-haha-dev` 仓的 `docs/repo-split.md`：CLI 引擎在那边，
 > 本仓只有 GUI / 插件 / 扩展 / 安装器。**`build/build.ts` 只消费 claude 二进制，
 > 不编译它** —— 所以构建前要么给 `--claude-from`，要么按 §1 的两仓 checkout 走。
+>
+> **功能层面的 mac 差异见 `docs/macos-compat.md`**（哪些平台分支是桩、哪些
+> 还没做、真机必验哪几条）。本文件只管「怎么打包」。
 
 ## 0. 架构决策速查
 
