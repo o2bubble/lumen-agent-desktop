@@ -4423,11 +4423,33 @@ fn hash_enc(s: &str) -> String {
 
 // ── 外部链接窗口 ──
 
-/// 主窗口导航守卫：URL 是否允许在主窗口导航（返回 true = 放行）。
-/// 只放行应用自身入口页（`tauri://` 或 `tauri.localhost` / dev `localhost`，且路径为入口）；
-/// 其余（外部 http(s)、相对/绝对路径 href 解析到 app origin 的导航）一律拦截，
-/// GUI 永不被替换。应用用哈希路由——片段导航不触发 on_navigation，无需放行其它路径。
+/// 主窗口导航守卫：URL 是否允许导航（返回 true = 放行）。
+///
+/// ⚠️ **这个回调对 iframe 的子框架导航同样生效。** 2026-11-11 在 Mac 上实测：
+/// 插件面板的 `<iframe src="plugins://localhost/...">` 一直白屏，网络面板里
+/// 连一条请求都没有 —— 原白名单只认 `tauri://` / `tauri.localhost`，`plugins://`
+/// 在发出请求之前就被这里挡掉了。
+///
+/// 放行三类：
+///   ① 插件内容：`plugins://<pluginName>/<src>` / `http(s)://plugins.localhost/...`
+///   ② 插件后台进程：`127.0.0.1:<port>` / `localhost:<port>` —— iframe 内部要
+///      fetch 自己的 HTTP 服务（office-preview 的 /file 就靠这条）
+///   ③ 应用自身入口页（`tauri://`、`tauri.localhost`、dev `localhost`），且路径为入口
+///
+/// 其余（外部 http(s)、相对路径 href 解析到 app origin 的导航）一律拦截，GUI 永不被替换。
+/// 应用用哈希路由 —— 片段导航不触发 on_navigation。
 fn is_allowed_navigation(url: &tauri::Url) -> bool {
+    // ①② 插件相关：整段放行，不看路径。
+    // `plugins://` 是 mac/Linux 的原样协议；`plugins.localhost` 是 Windows/Android
+    // 上 Tauri 对自定义协议的映射形式（见 src/services/pluginPanelBridge.tsx）。
+    match (url.scheme(), url.host_str()) {
+        ("plugins", _) => return true,
+        (_, Some("plugins.localhost")) => return true,
+        ("http", Some("127.0.0.1")) | ("http", Some("localhost")) => return true,
+        _ => {}
+    }
+
+    // ③ 应用自身入口页（原逻辑不变）
     let is_app_host = match (url.scheme(), url.host_str()) {
         ("tauri", _) => true,
         (_, Some("tauri.localhost")) => true,
@@ -7509,6 +7531,32 @@ mod tests {
     fn nav_other_schemes_blocked() {
         assert!(!is_allowed_navigation(&u("mailto:a@b.c")));
         assert!(!is_allowed_navigation(&u("file:///C:/x")));
+    }
+
+    #[test]
+    fn nav_plugin_content_allowed() {
+        // 插件面板 iframe（2026-11-11 Mac 白屏的根因：这些原先全被拦）
+        assert!(is_allowed_navigation(&u("plugins://localhost/office-preview/preview.html")));
+        assert!(is_allowed_navigation(&u("plugins://localhost/git-viewer/panel.html")));
+        // Windows/Android 的映射形式
+        assert!(is_allowed_navigation(&u("http://plugins.localhost/office-preview/preview.html")));
+        assert!(is_allowed_navigation(&u("https://plugins.localhost/x/y.html")));
+    }
+
+    #[test]
+    fn nav_plugin_local_server_allowed() {
+        // iframe 内部要 fetch 插件自己的后台进程
+        assert!(is_allowed_navigation(&u("http://127.0.0.1:52907/file?path=/x.docx")));
+        assert!(is_allowed_navigation(&u("http://localhost:52907/health")));
+    }
+
+    #[test]
+    fn nav_external_still_blocked_after_plugin_allowance() {
+        // 放行插件后，外部站点必须仍然被拦 —— 别把口子开太大
+        assert!(!is_allowed_navigation(&u("https://example.com/plugins/")));
+        assert!(!is_allowed_navigation(&u("http://127.0.0.1.evil.com/x")));
+        assert!(!is_allowed_navigation(&u("http://plugins.localhost.evil.com/x")));
+        assert!(!is_allowed_navigation(&u("https://notplugins.localhost/x")));
     }
 
     // ── 全文搜索 ──

@@ -1,0 +1,9 @@
+# Shell 脚本必须保持 LF —— CRLF 会让 shebang 变成 "#!/bin/bash\r"，
+# macOS/Linux 报 "bad interpreter: No such file or directory"，脚本直接跑不起来。
+*.sh            text eol=lf
+*.command       text eol=lf
+scripts/install-mac.sh  text eol=lf
+
+# Windows 脚本保持 CRLF
+*.cmd           text eol=crlf
+*.bat           text eol=crlf
