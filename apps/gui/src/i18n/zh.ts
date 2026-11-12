@@ -703,6 +703,8 @@ const zh = {
     unknownContentType: "未知内容类型",
     dragToConnect: "拖拽连线",
     dragToConnectSide: "拖拽连线 ({side})",
+    itemRenderFailed: "这一块渲染失败",
+    itemRenderFailedHint: "内容格式不对，点重试可用空白结构打开；其余内容不受影响。",
     noDesktop: "暂无桌面",
     loadFailed: "桌面数据加载失败，请重试",
     mermaidError: "Mermaid 渲染失败",

@@ -271,3 +271,66 @@ describe("gridThemeParams", () => {
     expect(p.foregroundColor).not.toBe("#1a1a1a");
   });
 });
+
+// ── AI 生成内容形状不对时的兜底（2026-11-27 线上崩溃）──
+//
+// 用户报「隔壁 agent 生成的内容都提示错误」，整个面板变成
+// 「SuperDesktopCanvas 加载失败 / Cannot read properties of undefined (reading 'undefined')」。
+// 根因就是下面这两类畸形 data。
+describe("畸形 content 不会崩（渲染层兜底）", () => {
+  const base = { type: "table" as const };
+
+  it("扁平行 {id, colA:'x'}（没有 cells）不再抛错，且数据不丢", () => {
+    const content = {
+      ...base,
+      columns: [{ id: "major", name: "专业" }],
+      rows: [{ id: "r1", major: "电气" }],
+    } as unknown as TableContent;
+
+    expect(() => toRowData(content)).not.toThrow();
+    expect(toRowData(content)).toEqual([{ id: "r1", major: "电气" }]);
+  });
+
+  it("行是 null / 字符串也不崩", () => {
+    const content = {
+      ...base,
+      columns: [{ id: "a", name: "A" }],
+      rows: [null, "oops", 42],
+    } as unknown as TableContent;
+
+    expect(() => toRowData(content)).not.toThrow();
+    expect(toRowData(content)).toHaveLength(3);
+    expect(toRowData(content).every((r) => r.id)).toBe(true);
+  });
+
+  it("列缺 id 时跳过该列，不产出 undefined 键", () => {
+    const content = {
+      ...base,
+      columns: [{ name: "没有 id 的列" }, { id: "ok", name: "OK" }],
+      rows: [{ id: "r1", cells: { ok: "值" } }],
+    } as unknown as TableContent;
+
+    expect(() => toRowData(content)).not.toThrow();
+    const row = toRowData(content)[0];
+    expect(Object.keys(row)).not.toContain("undefined");
+    expect(row.ok).toBe("值");
+  });
+
+  it("columns 整个缺失也不崩", () => {
+    const content = { rows: [] } as unknown as TableContent;
+    expect(() => toColumnDefs(content)).not.toThrow();
+    expect(() => toRowData(content)).not.toThrow();
+    expect(toColumnDefs(content)).toEqual([]);
+  });
+
+  it("columns 里混了 null 条目", () => {
+    const content = {
+      ...base,
+      columns: [null, { id: "a", name: "A" }, undefined],
+      rows: [{ id: "r1", cells: { a: "1" } }],
+    } as unknown as TableContent;
+
+    expect(() => toColumnDefs(content)).not.toThrow();
+    expect(toRowData(content)).toEqual([{ id: "r1", a: "1" }]);
+  });
+});

@@ -7,18 +7,25 @@ import type {
   ValueFormatterParams,
 } from "ag-grid-community";
 import { themeQuartz } from "ag-grid-community";
-import type { TableContent, TableColumn, TableCell } from "../types/desktop";
+import type { TableContent, TableColumn, TableCell, TableRow } from "../types/desktop";
 import { isDarkTheme } from "./themeUtils";
 
 // ── Schema 遍历 ──
 
-/** 按顺序展开全部叶子列（组表头不承载数据，叶子才承载） */
+/**
+ * 按顺序展开全部叶子列（组表头不承载数据，叶子才承载）。
+ *
+ * 跳过 null / 非对象 / 无 id 的列 —— AI 生成的 content 什么都可能塞进来，
+ * 而这里抛错会让整个桌面打不开（不是只有这张表坏）。
+ */
 export function leafColumns(columns: TableColumn[]): TableColumn[] {
   const out: TableColumn[] = [];
   const walk = (cols: TableColumn[]) => {
+    if (!Array.isArray(cols)) return;
     for (const c of cols) {
-      if (c.children?.length) walk(c.children);
-      else out.push(c);
+      if (!c || typeof c !== "object") continue;
+      if (Array.isArray(c.children) && c.children.length) walk(c.children);
+      else if (c.id) out.push(c);
     }
   };
   walk(columns);
@@ -99,13 +106,17 @@ function leafColDef(content: TableContent, col: TableColumn): ColDef {
  * 旧数据（扁平列、无 pinned/formats）产出与旧行为等价的纯字段列。
  */
 export function toColumnDefs(content: TableContent): (ColDef | ColGroupDef)[] {
-  const walk = (cols: TableColumn[]): (ColDef | ColGroupDef)[] =>
-    cols.map((c) =>
-      c.children?.length
-        ? { headerName: c.name, marryChildren: true, children: walk(c.children) }
-        : leafColDef(content, c),
-    );
-  return walk(content.columns);
+  const walk = (cols: TableColumn[]): (ColDef | ColGroupDef)[] => {
+    if (!Array.isArray(cols)) return [];
+    return cols
+      .filter((c) => c && typeof c === "object" && (c.id || Array.isArray(c.children)))
+      .map((c) =>
+        Array.isArray(c.children) && c.children.length
+          ? { headerName: c.name, marryChildren: true, children: walk(c.children) }
+          : leafColDef(content, c),
+      );
+  };
+  return walk(content.columns ?? []);
 }
 
 // ── 行数据 ──
@@ -115,11 +126,41 @@ export function toColumnDefs(content: TableContent): (ColDef | ColGroupDef)[] {
  * 缺失 cell 补空串（防 undefined 渲染）；rowId 存进 `id` 供编辑回写定位。
  */
 export function toRowData(content: TableContent): Record<string, string>[] {
-  const leaves = leafColumns(content.columns).map((c) => c.id);
-  return content.rows.map((r) => {
+  const leaves = leafColumns(content.columns ?? []).map((c) => c.id);
+
+  // 这里的防御不是多余（2026-11-27 线上报错）：
+  //
+  // AI 用 `rows:[{id:'r1', major:'专业'}]` 这种**扁平行**建表时 `r.cells` 是
+  // undefined，`r.cells[colId]` 直接抛
+  //   Cannot read properties of undefined (reading 'undefined')
+  // （列 id 也可能缺失，所以属性名显示成 'undefined'）。整个画布随之崩溃 ——
+  // 用户看到的就是「面板 SuperDesktopCanvas 加载失败」。
+  //
+  // MCP 侧只校验了 rows 是数组，数组里每行的形状没管。渲染层必须自己兜住。
+  return normalizeRows(content.rows).map((r) => {
     const out: Record<string, string> = { id: r.id };
-    for (const colId of leaves) out[colId] = r.cells[colId] ?? "";
+    for (const colId of leaves) {
+      if (colId) out[colId] = r.cells[colId] ?? "";
+    }
     return out;
+  });
+}
+
+/**
+ * 把 AI 可能写出的「扁平行」宽容成标准结构。
+ *
+ * 这是渲染层的最后一层兜底，不替代 MCP 侧的校验 —— 只是保证**不会崩**。
+ */
+function normalizeRows(rows: unknown): TableContent["rows"] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((r: any, i: number) => {
+    if (!r || typeof r !== "object") return { id: `r${i + 1}`, cells: {} };
+    if (r.cells && typeof r.cells === "object") {
+      return { id: r.id || `r${i + 1}`, cells: r.cells };
+    }
+    // 扁平写法 {id, colA: 'x', colB: 'y'} → {id, cells:{colA:'x',colB:'y'}}
+    const { id, ...rest } = r;
+    return { id: id || `r${i + 1}`, cells: rest as Record<string, string> };
   });
 }
 

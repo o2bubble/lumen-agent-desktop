@@ -871,7 +871,53 @@ function SuperDesktopCanvasImpl({ desktop, searchMatchedIds }: Props) {
 
       <div style={transformStyle}>
         {desktop.items.map((item) => (
-          <DesktopItemView key={item.id} item={item} scale={desktop.zoom} connectionMode={!!connDrag.current} highlighted={highlightedItemId === item.id} selected={selectedIds.has(item.id)} suppressOwnDrag={selectedIds.size >= 2 && selectedIds.has(item.id)} dimmed={!!searchMatchedIds && !searchMatchedIds.has(item.id)} />
+          // 每个 block 单独一圈 ErrorBoundary（2026-11-27）。
+          //
+          // 之前只有最外层一圈：任意一个 item 渲染抛错，**整个桌面变成
+          // 「面板 SuperDesktopCanvas 加载失败」**——其余好 block 一起消失，
+          // 点重试还是崩（坏数据还在）。
+          //
+          // AI 生成的内容形状不对是常态（比如表格写成扁平行），
+          // 一个坏 block 只该坏它自己。
+          <ErrorBoundary
+            key={item.id}
+            panelName={`desktop-item:${item.content?.type ?? "?"}`}
+            fallback={(err) => (
+              <div
+                style={{
+                  position: "absolute",
+                  left: item.x,
+                  top: item.y,
+                  width: item.width,
+                  height: item.height,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
+                  padding: 12,
+                  boxSizing: "border-box",
+                  border: "1px dashed var(--danger, #e5645f)",
+                  borderRadius: 6,
+                  background: "var(--bg)",
+                  color: "var(--fg-muted)",
+                  fontSize: 12,
+                  textAlign: "center",
+                }}
+                title={String(err?.message ?? err)}
+              >
+                <span style={{ fontWeight: 600, color: "var(--fg)" }}>
+                  {t("desktop.itemRenderFailed")}
+                </span>
+                <span style={{ lineHeight: 1.5 }}>{t("desktop.itemRenderFailedHint")}</span>
+                <code style={{ fontSize: 10, opacity: 0.7, wordBreak: "break-all" }}>
+                  {String(err?.message ?? err).slice(0, 120)}
+                </code>
+              </div>
+            )}
+          >
+            <DesktopItemView item={item} scale={desktop.zoom} connectionMode={!!connDrag.current} highlighted={highlightedItemId === item.id} selected={selectedIds.has(item.id)} suppressOwnDrag={selectedIds.size >= 2 && selectedIds.has(item.id)} dimmed={!!searchMatchedIds && !searchMatchedIds.has(item.id)} />
+          </ErrorBoundary>
         ))}
       </div>
 

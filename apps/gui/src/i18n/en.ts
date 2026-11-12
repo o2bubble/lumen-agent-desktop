@@ -704,6 +704,8 @@ const en: Locale = {
     unknownContentType: "Unknown content type",
     dragToConnect: "Drag to connect",
     dragToConnectSide: "Drag to connect ({side})",
+    itemRenderFailed: "This block failed to render",
+    itemRenderFailedHint: "Its content is malformed. Retry opens it empty; other blocks are unaffected.",
     noDesktop: "No desktop available",
     loadFailed: "Failed to load desktop data, please retry",
     mermaidError: "Mermaid render failed",
