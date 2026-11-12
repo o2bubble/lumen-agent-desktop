@@ -128,3 +128,44 @@ describe("内容内部缩放优先", () => {
     expect(route({ dy: 120, ctrl: true, overContentZoom: false, chain: [] })).toBe("canvas-zoom");
   });
 });
+
+// ── 幽灵溢出（2026-11-12 用户第二次报「block 多了缩放又失效」）──
+//
+// DesktopItemView 的内容包装层是 overflow:auto，布局取整常带几像素多余空间。
+// 旧规则「能滚就让路」会让这几像素吃掉一整个滚轮刻度 —— 块铺满视口后，
+// 每次滚轮都落在新块上被吃掉，体感就是缩放完全失效。
+describe("几像素的幽灵溢出不该吃掉滚轮", () => {
+  /** 实测的典型值：232 vs 224 → 只有 8px 可滚。 */
+  const phantom = box({ overflowY: "auto", scrollHeight: 232, clientHeight: 224, scrollTop: 0 });
+
+  it("向下滚：8px 溢出 → 仍然缩放画布", () => {
+    expect(route({ dy: 120, chain: [phantom] })).toBe("canvas-zoom");
+  });
+
+  it("向上滚：8px 溢出 → 缩放画布", () => {
+    expect(route({ dy: -120, chain: [phantom] })).toBe("canvas-zoom");
+  });
+
+  it("横向同样的幽灵溢出也不吃", () => {
+    const px = box({ overflowX: "auto", scrollWidth: 508, clientWidth: 500, scrollLeft: 0 });
+    expect(route({ dx: 120, chain: [px] })).toBe("canvas-zoom");
+    expect(route({ dx: -120, chain: [px] })).toBe("canvas-zoom");
+  });
+
+  it("真能滚的容器（余量充足）依然优先滚动", () => {
+    const real = box({ overflowY: "auto", scrollHeight: 1895, clientHeight: 606, scrollTop: 0 });
+    expect(route({ dy: 120, chain: [real] })).toBe("scroll");
+  });
+
+  it("十几块幽灵溢出的块叠起来也不该挡缩放", () => {
+    const many = Array.from({ length: 15 }, () =>
+      box({ overflowY: "auto", scrollHeight: 232, clientHeight: 224, scrollTop: 0 }));
+    expect(route({ dy: 120, chain: many })).toBe("canvas-zoom");
+    expect(route({ dy: -120, chain: many })).toBe("canvas-zoom");
+  });
+
+  it("幽灵块 + 一个真能滚的块 → 让给真能滚的那个", () => {
+    const real = box({ overflowY: "auto", scrollHeight: 1895, clientHeight: 606, scrollTop: 100 });
+    expect(route({ dy: 120, chain: [phantom, real] })).toBe("scroll");
+  });
+});

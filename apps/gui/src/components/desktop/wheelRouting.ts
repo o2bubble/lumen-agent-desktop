@@ -26,6 +26,23 @@ export type WheelRoute = "content-zoom" | "scroll" | "canvas-zoom";
 /** 亚像素容差：scrollHeight/clientHeight 是取整值，缩放后的布局差 1px 很常见。 */
 const EPS = 1;
 
+/**
+ * 一个容器至少要还能滚这么多像素，才值得把滚轮让给它。
+ *
+ * 为什么需要（2026-11-12，用户第二次报「block 多了缩放又失效」）：
+ * `DesktopItemView` 的内容包装层是 `overflow:auto`，布局取整后常常带
+ * **几像素的幽灵溢出**（实测 232 vs 224 → 8px）。按「能滚就让路」的规则，
+ * 这几像素会吃掉**一整个滚轮刻度** —— 100px 的 delta 里只消费 8px，
+ * 剩下 92px 没有任何人消费，画布也没收到。
+ *
+ * 单独一个块不明显；但块铺满视口后，每次滚轮都落在新的块上、被它那几像素
+ * 吃掉 —— 用户体感就是「缩放彻底失效」。
+ *
+ * 24 的取值：明显大于取整误差（通常 < 10px），又远小于一个滚轮刻度，
+ * 真能滚的容器不会被误判成「已经到头」。
+ */
+const MIN_CONSUMABLE_PX = 24;
+
 function canScrollY(b: ScrollableBox): boolean {
   return (b.overflowY === "auto" || b.overflowY === "scroll") && b.scrollHeight > b.clientHeight + EPS;
 }
@@ -34,12 +51,12 @@ function canScrollX(b: ScrollableBox): boolean {
   return (b.overflowX === "auto" || b.overflowX === "scroll") && b.scrollWidth > b.clientWidth + EPS;
 }
 
-/** 这个容器在当前滚动位置还能否消费该方向的位移。 */
+/** 这个容器在当前滚动位置还能否**有意义地**消费该方向的位移。 */
 function consumes(b: ScrollableBox, deltaX: number, deltaY: number): boolean {
-  if (deltaY < 0 && canScrollY(b) && b.scrollTop > EPS) return true;
-  if (deltaY > 0 && canScrollY(b) && b.scrollTop + b.clientHeight < b.scrollHeight - EPS) return true;
-  if (deltaX < 0 && canScrollX(b) && b.scrollLeft > EPS) return true;
-  if (deltaX > 0 && canScrollX(b) && b.scrollLeft + b.clientWidth < b.scrollWidth - EPS) return true;
+  if (deltaY < 0 && canScrollY(b) && b.scrollTop >= MIN_CONSUMABLE_PX) return true;
+  if (deltaY > 0 && canScrollY(b) && b.scrollHeight - b.clientHeight - b.scrollTop >= MIN_CONSUMABLE_PX) return true;
+  if (deltaX < 0 && canScrollX(b) && b.scrollLeft >= MIN_CONSUMABLE_PX) return true;
+  if (deltaX > 0 && canScrollX(b) && b.scrollWidth - b.clientWidth - b.scrollLeft >= MIN_CONSUMABLE_PX) return true;
   return false;
 }
 
