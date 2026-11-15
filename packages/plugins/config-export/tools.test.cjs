@@ -308,3 +308,185 @@ test("resolveTarget: 未映射 ~/.skills 不报 unresolvable", () => {
   const got = resolveTarget("~/.skills/a/SKILL.md", "/root");
   assert.ok(got && got.replace(/\\/g, "/").endsWith("/root/.skills/a/SKILL.md"));
 });
+
+// ══════════════════════════════════════════════════════════════
+// 撞名会话：sessionId 复用 ≠ 同一会话的两个进度（2026-11-15）
+// ══════════════════════════════════════════════════════════════
+//
+// 真实事故：`56342174` 在导出机是 11-06→11-09、本机是 11-11→11-15，
+// 两个文件的 uuid **零交集**。旧版 session-diff 的 hint 是「可以按 uuid 合并」，
+// session-merge 也照做不误（因为没有同 uuid 不同内容，不触发冲突门）。
+// 结果会缝出一段跨 9 天、上下文无关的对话，还报 ok:true。
+
+test("session-diff: 同文件名 + 零共享 uuid → 报 id 复用，禁止合并", () => {
+  const dir = path.join(HOME, "reuse-a");
+  fs.mkdirSync(dir, { recursive: true });
+  const a = path.join(dir, "sess1.jsonl");
+  const b = path.join(HOME, "reuse-b", "sess1.jsonl");
+  fs.mkdirSync(path.dirname(b), { recursive: true });
+  fs.writeFileSync(a, '{"sessionId":"sess1","uuid":"u1","timestamp":"2026-11-06T00:00:00Z"}\n');
+  fs.writeFileSync(b, '{"sessionId":"sess1","uuid":"u9","timestamp":"2026-11-11T00:00:00Z"}\n');
+
+  const r = run(["session-diff", a, b]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.shared, 0);
+  assert.strictEqual(r.idReuse.detected, true, "零共享 uuid 且同文件名 → 必须是 id 复用");
+  assert.ok(r.hint.includes("禁止"), `hint 不能建议合并，实际：${r.hint}`);
+});
+
+test("session-diff: 不同会话、零共享 uuid → 不算 id 复用（拼接是合法用法）", () => {
+  const a = path.join(HOME, "p1.jsonl");
+  const b = path.join(HOME, "p2.jsonl");
+  fs.writeFileSync(a, '{"sessionId":"aaa","uuid":"u1"}\n');
+  fs.writeFileSync(b, '{"sessionId":"bbb","uuid":"u2"}\n');
+  const r = run(["session-diff", a, b]);
+  assert.strictEqual(r.idReuse.detected, false, "两个不相干的导出拼起来是合法的");
+  assert.ok(r.hint.includes("合并"));
+});
+
+test("session-merge: 同会话身份 + 零共享 uuid → 拒绝并指向 session-fork", () => {
+  const dir = path.join(HOME, "reuse-m");
+  fs.mkdirSync(dir, { recursive: true });
+  const a = path.join(dir, "same.jsonl");
+  const b = path.join(HOME, "reuse-m2", "same.jsonl");
+  fs.mkdirSync(path.dirname(b), { recursive: true });
+  const o = path.join(HOME, "reuse-out.jsonl");
+  fs.writeFileSync(a, '{"sessionId":"same","uuid":"u1"}\n');
+  fs.writeFileSync(b, '{"sessionId":"same","uuid":"u2"}\n');
+
+  const r = run(["session-merge", a, b, "-o", o]);
+  assert.strictEqual(r.ok, false, "必须拒绝合并");
+  assert.ok(r.hint.includes("session-fork"));
+  assert.ok(!fs.existsSync(o), "拒绝时不该产生输出文件");
+});
+
+// ── session-fork：另存为新 sessionId，正文不动 ──
+
+test("session-fork: 只改 sessionId 字段，正文里提到的旧 id 保留", () => {
+  const src = path.join(HOME, "fork-src.jsonl");
+  const dst = path.join(HOME, "fork-out.jsonl");
+  fs.writeFileSync(
+    src,
+    [
+      '{"sessionId":"old-id","uuid":"u1","message":"见会话 old-id 的结论"}',
+      '{"sessionId":"old-id","uuid":"u2","message":"无关"}',
+    ].join("\n") + "\n",
+  );
+  const r = run(["session-fork", src, "--new-id", "new-id", "-o", dst]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.sessionIdFieldsRewritten, 2);
+
+  const lines = fs.readFileSync(dst, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(lines.every((o) => o.sessionId === "new-id"), "sessionId 全部换新");
+  assert.ok(
+    lines[0].message.includes("old-id"),
+    "正文里的旧 id 是历史内容，**不能**被改写（2026-11-15 手工 replaceAll 误伤 48 处）",
+  );
+});
+
+test("session-fork: 不给 --new-id 也能生成（自动配 uuid）", () => {
+  const src = path.join(HOME, "fork-auto.jsonl");
+  fs.writeFileSync(src, '{"sessionId":"x","uuid":"u1"}\n');
+  const r = run(["session-fork", src]);
+  assert.strictEqual(r.ok, true);
+  assert.ok(/^[0-9a-f-]{36}$/.test(r.newSessionId));
+  assert.ok(fs.existsSync(r.output));
+});
+
+// ══════════════════════════════════════════════════════════════
+// 项目 slug ≠ 项目（工作区搬家）
+// ══════════════════════════════════════════════════════════════
+//
+// 真实事故：`C:\Storage\claude-code-haha-dev` 搬到 `D:\Development\...` 后
+// slug 从 `C--Storage-...` 变成 `D--Development-...`，compare 报 388 missing，
+// 看起来像「包里少了半个」，实际只需要重映射。
+
+test("slugOfPath: 非字母数字一律压成 -（与 GUI 生成规则一致）", () => {
+  const { slugOfPath } = require("./restore-tools.cjs");
+  assert.strictEqual(
+    slugOfPath(String.raw`D:\Development\claude-code-haha-dev`),
+    "D--Development-claude-code-haha-dev",
+  );
+  assert.strictEqual(
+    slugOfPath(String.raw`C:\Users\MR\claude-code-workspace`),
+    "C--Users-MR-claude-code-workspace",
+  );
+  assert.strictEqual(
+    slugOfPath(String.raw`C:\Storage\work\EL-Ruoyi`),
+    "C--Storage-work-EL-Ruoyi",
+  );
+});
+
+test("analyzeProjects: 同一项目换了盘符 → remap，并给出可用的 --map 片段", () => {
+  const { analyzeProjects } = require("./restore-tools.cjs");
+  const root = path.join(HOME, "slug-root");
+  fs.mkdirSync(path.join(root, ".claude", "projects", "D--Development-proj"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, ".claude", "settings.json"),
+    JSON.stringify({ gui: { workspaces: [String.raw`D:\Development\proj`] } }),
+  );
+  const mf = {
+    items: [
+      { relPath: "claude/projects/C--Storage-proj/abc.jsonl", category: "claude-sessions", size: 10 },
+      { relPath: "claude/projects/C--Storage-proj/memory/MEMORY.md", category: "claude-memory", size: 5 },
+    ],
+  };
+  const r = analyzeProjects(mf, root);
+  const p = r.projects.find((x) => x.packageSlug === "C--Storage-proj");
+  assert.strictEqual(p.action, "remap");
+  assert.strictEqual(p.localSlug, "D--Development-proj");
+  // mapArg 的目标是基于 destRoot 拼的（真实运行时 destRoot 就是家目录）
+  assert.ok(
+    r.summary.mapArg.includes("~/.claude/projects/C--Storage-proj=") &&
+      r.summary.mapArg.includes("D--Development-proj"),
+    `--map 片段要能直接用，实际：${r.summary.mapArg}`,
+  );
+});
+
+test("analyzeProjects: 本机和 GUI 都没有该项目 → absent + recommendSkip", () => {
+  const { analyzeProjects } = require("./restore-tools.cjs");
+  const root = path.join(HOME, "slug-root2");
+  fs.mkdirSync(path.join(root, ".claude", "projects"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".claude", "settings.json"), JSON.stringify({ gui: { workspaces: [] } }));
+  const mf = {
+    items: [{ relPath: "claude/projects/C--Storage-gone/x.jsonl", category: "claude-sessions", size: 1 }],
+  };
+  const r = analyzeProjects(mf, root);
+  const p = r.projects[0];
+  assert.strictEqual(p.action, "absent");
+  assert.strictEqual(p.recommendSkip, true, "本机没有的项目默认不恢复 —— 恢复了也没地方用");
+  assert.strictEqual(r.summary.recommendSkip, 1);
+});
+
+test("analyzeProjects: GUI 里有该项目但会话目录没建 → absent 但不劝退", () => {
+  const { analyzeProjects } = require("./restore-tools.cjs");
+  const root = path.join(HOME, "slug-root3");
+  fs.mkdirSync(path.join(root, ".claude", "projects"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, ".claude", "settings.json"),
+    JSON.stringify({ gui: { workspaces: [String.raw`D:\Development\live`] } }),
+  );
+  const mf = { items: [{ relPath: "claude/projects/C--Storage-live/x.jsonl", category: "claude-sessions", size: 1 }] };
+  const r = analyzeProjects(mf, root);
+  const p = r.projects[0];
+  assert.strictEqual(p.action, "absent");
+  assert.strictEqual(p.recommendSkip, false, "工作区还在 → 只是会话没建，值得恢复");
+  assert.ok(p.guiWorkspacePath);
+});
+
+test("analyzeProjects: 多个同名候选 → ambiguous，不替用户选", () => {
+  const { analyzeProjects } = require("./restore-tools.cjs");
+  const root = path.join(HOME, "slug-root4");
+  fs.mkdirSync(path.join(root, ".claude", "projects", "C--Users-A-proj"), { recursive: true });
+  fs.mkdirSync(path.join(root, ".claude", "projects", "C--Users-B-proj"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, ".claude", "settings.json"),
+    JSON.stringify({
+      gui: { workspaces: [String.raw`C:\Users\A\proj`, String.raw`C:\Users\B\proj`] },
+    }),
+  );
+  const mf = { items: [{ relPath: "claude/projects/C--Storage-proj/x.jsonl", category: "claude-sessions", size: 1 }] };
+  const r = analyzeProjects(mf, root);
+  assert.strictEqual(r.projects[0].action, "ambiguous");
+  assert.strictEqual(r.projects[0].candidates.length, 2);
+});

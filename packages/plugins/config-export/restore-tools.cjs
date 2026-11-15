@@ -18,6 +18,8 @@
 //   rate        <pkg> --dest <dir>          算恢复率（见下「恢复率怎么算」）
 //   session-diff <a.jsonl> <b.jsonl>        比较两个会话文件的差异（按 uuid）
 //   session-merge <base> <other> -o <out>   按 uuid 合并两个会话（自动备份原文件）
+//   session-fork <src.jsonl> [--new-id <u>] [-o <out>]
+//                                           撞名时另存为新 sessionId（只改字段，不动正文）
 //   json-merge  <base.json> <other.json>    预览两个 JSON 的按键合并结果（不写盘）
 //   extract     <pkg> --dest <dir>          解包到目标目录
 //               [--only <正则>]             只解压匹配的条目（跳过其余，省下大部分 I/O）
@@ -25,6 +27,17 @@
 // compare / rate / verify 都接受 `--map`：
 //   --map "~=C:/Users/me,%APPDATA%=C:/Users/me/AppData/Roaming,<workspace>=D:/proj,.skills=C:/Users/me/.claude/skills"
 // 用来处理「导出机的路径在导入机上不存在」——不映射的话这些条目只会报 unresolvable / missing。
+//
+// compare / rate 另外接受 `--settings <path>`（默认 `<dest>/.claude/settings.json`），
+// 用来读 `gui.workspaces` 判断「这个项目本机还要不要」。
+//
+// ## ⚠️ 项目 slug 不等于项目（2026-11-15）
+//
+// `~/.claude/projects/<slug>` 的 slug 是**项目绝对路径**的编码。工作区一搬家
+// （`C:\Storage\x` → `D:\Development\x`），slug 全变，但项目还是同一个。
+// 所以 compare/rate 会顺带输出 `projects[]`：逐个项目给出
+// `exact`（本机有）/ `remap`（同项目不同 slug，附 `suggestedMap`）/ `absent`（本机没有）。
+// **`absent` 且 `recommendSkip` 的默认不恢复** —— 本机连工作区都没有，恢复它干什么。
 //
 // ## ⚠️ 这些是**参考实现**，不是必须照抄的教条
 //
@@ -129,7 +142,7 @@ function argOf(argv, name, def = undefined) {
 }
 
 function posArgs(argv) {
-  const flags = new Set(["--dest", "-o", "--name"]);
+  const flags = new Set(["--dest", "-o", "--name", "--map", "--settings", "--new-id"]);
   const out = [];
   for (let i = 0; i < argv.length; i++) {
     if (flags.has(argv[i])) { i++; continue; }
@@ -435,6 +448,159 @@ function parseMap(argv) {
   return Object.keys(map).length ? map : undefined;
 }
 
+/**
+ * slug 是**项目绝对路径的编码**：非字母数字一律压成 `-`。
+ *   `D:\Development\claude-code-haha-dev` → `D--Development-claude-code-haha-dev`
+ *
+ * 🔴 工作区搬家后（`C:\Storage\...` → `D:\Development\...`）**整个 slug 都变**，
+ * 但项目是同一个。2026-11-15 实测：`compare` 报的 388 条 missing 里 330 条
+ * 全是这一个原因 —— 看起来「包里少了半个」，实际只是要重映射。
+ *
+ * 所以**绝不能拿 slug 做纯文本全量比较**。这里改成用真实数据对齐：
+ * 从本机 GUI 工作区的绝对路径反推 slug + 项目名，再按项目名匹配。
+ *
+ * ⚠️ 不写「从 slug 反推项目名」的正则 —— `-` 既是分隔符又可能是目录名的一部分，
+ * 反推出的名字不可靠。宁可报「不确定」，也不给一个看似聪明的错答案。
+ */
+function slugOfPath(absPath) {
+  return String(absPath).replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+/** 本机 ~/.claude/projects 下真实存在的 slug 目录 */
+function localProjectSlugs(destRoot) {
+  try {
+    return fs.readdirSync(path.join(destRoot, ".claude", "projects"), { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 读 GUI 工作区列表（`~/.claude/settings.json` 的 `gui.workspaces`）。
+ * 这是**用户实际在用的项目**的权威清单 —— 判断「本机还要不要这个项目」靠它。
+ */
+function readGuiWorkspaces(destRoot, settingsPath) {
+  const p = settingsPath || path.join(destRoot, ".claude", "settings.json");
+  try {
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    return ((j.gui && j.gui.workspaces) || []).filter((w) => typeof w === "string");
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 判断包内每个项目 slug 在本机的归属。
+ *
+ * 判定只看**真实存在的东西**，不猜：
+ *   · `exact`   —— 本机有同名 slug 目录
+ *   · `remap`   —— 本机没有该 slug，但有 GUI 工作区**同名项目**（路径搬过家）
+ *   · `absent`  —— 本机和 GUI 工作区都没有这个项目 → recommendSkip
+ *
+ * `remap` 只在**唯一命中**时给出；多个候选就报 `ambiguous`，不替用户选。
+ */
+function analyzeProjects(mf, destRoot, settingsPath) {
+  const localSlugs = localProjectSlugs(destRoot);
+  const guiWs = readGuiWorkspaces(destRoot, settingsPath);
+  const lowerLocal = new Map(localSlugs.map((s) => [s.toLowerCase(), s]));
+
+  // 项目名 → 本机真实路径（来自 GUI 工作区，不是从 slug 猜的）。
+  // ⚠️ 用数组不用 Map：两个同名工作区（不同盘 / 不同父目录）会互相覆盖，
+  // 「多个候选」就永远只剩一个 → 静默挑错项目。这正是 ambiguous 要防的。
+  const guiByName = [];
+  for (const w of guiWs) {
+    const name = path.basename(String(w).replace(/[\\/]+$/, "")).toLowerCase();
+    if (name) guiByName.push({ name, absPath: w });
+  }
+
+  // 聚合：每个 slug 下有多少文件、多少字节
+  // relPath 形如 `claude/projects/<slug>/...`（不带前导点，与 restore.target 不同）
+  const bySlug = new Map();
+  for (const it of mf.items || []) {
+    const m = String(it.relPath).match(/^(?:\.?claude|data\/claude)\/(?:projects|workspaces)\/([^/]+)\//);
+    if (!m) continue;
+    const s = bySlug.get(m[1]) || { files: 0, bytes: 0, categories: new Set() };
+    s.files++;
+    s.bytes += it.size || 0;
+    s.categories.add(it.category);
+    bySlug.set(m[1], s);
+  }
+
+  const projects = [];
+  const maps = {};
+  for (const [slug, agg] of [...bySlug.entries()].sort((a, b) => b[1].files - a[1].files)) {
+    const hit = lowerLocal.get(slug.toLowerCase());
+    let entry = {
+      packageSlug: slug,
+      files: agg.files,
+      bytes: agg.bytes,
+      categories: [...agg.categories],
+    };
+
+    if (hit) {
+      Object.assign(entry, { action: "exact", localSlug: hit, reason: "本机已有同名 slug 目录" });
+    } else {
+      // 用 GUI 工作区拿项目名：包内 slug 以该工作区的项目名结尾 → 同一个项目
+      const candidates = [];
+      for (const { name, absPath } of guiByName) {
+        if (slug.toLowerCase().endsWith(name)) {
+          const target = lowerLocal.get(slugOfPath(absPath).toLowerCase());
+          candidates.push({ name, absPath, localSlug: target || null });
+        }
+      }
+      const resolved = candidates.filter((c) => c.localSlug);
+
+      if (resolved.length === 1) {
+        const c = resolved[0];
+        Object.assign(entry, {
+          action: "remap",
+          localSlug: c.localSlug,
+          guiWorkspacePath: c.absPath,
+          reason: `本机没有这个 slug，但 GUI 工作区 "${c.name}" 是同一项目（路径搬过家？）`,
+        });
+        maps[`~/.claude/projects/${slug}`] =
+          path.join(destRoot, ".claude", "projects", c.localSlug);
+      } else if (resolved.length > 1) {
+        Object.assign(entry, {
+          action: "ambiguous",
+          candidates: resolved.map((c) => c.localSlug),
+          reason: `${resolved.length} 个本机项目同名，需要用户指定`,
+        });
+      } else {
+        // GUI 工作区里有没有这个名字（有 = 项目还在，只是会话没建；没有 = 项目都删了）
+        const guiOnly = guiByName.find((g) => slug.toLowerCase().endsWith(g.name));
+        Object.assign(entry, {
+          action: "absent",
+          guiWorkspacePath: guiOnly ? guiOnly.absPath : null,
+          recommendSkip: !guiOnly,
+          reason: guiOnly
+            ? "GUI 工作区有该项目，但本机还没有它的会话目录 —— 恢复时放在原 slug 下即可"
+            : "本机和 GUI 工作区都没有这个项目 —— **建议跳过**，恢复了也没有对应工作区",
+        });
+      }
+    }
+    projects.push(entry);
+  }
+
+  return {
+    projects,
+    localProjects: localSlugs,
+    guiWorkspaces: guiWs,
+    summary: {
+      exact: projects.filter((p) => p.action === "exact").length,
+      remap: projects.filter((p) => p.action === "remap").length,
+      absent: projects.filter((p) => p.action === "absent").length,
+      ambiguous: projects.filter((p) => p.action === "ambiguous").length,
+      recommendSkip: projects.filter((p) => p.recommendSkip).length,
+      // 只含 remap 的 --map 片段，可直接拼进命令行
+      mapArg: Object.keys(maps).length ? Object.entries(maps).map(([k, v]) => `${k}=${v}`).join(",") : null,
+    },
+    maps,
+  };
+}
+
 async function cmdCompare(argv) {
   const [pkg] = posArgs(argv);
   const dest = argOf(argv, "--dest");
@@ -454,6 +620,25 @@ async function cmdCompare(argv) {
   }
 
   const count = (s) => rows.filter((r) => r.status === s).length;
+  const projectInfo = analyzeProjects(mf, dest, argOf(argv, "--settings"));
+
+  // 🔴 整类缺失预警：某个项目在本机根本不存在时，逐条报 missing 会误导成
+  // 「包里少了东西」。单独说清楚，并把能用的 --map 直接给出来。
+  const warn = [];
+  if (projectInfo.summary.remap > 0) {
+    warn.push(
+      `有 ${projectInfo.summary.remap} 个项目是**同一项目、不同 slug**（路径搬过家）` +
+      `—— 这些条目现在报 missing，加上 --map 就对了`,
+    );
+  }
+  if (projectInfo.summary.absent > 0) {
+    warn.push(
+      `有 ${projectInfo.summary.absent} 个项目本机**完全不存在**（其中 ` +
+      `${projectInfo.summary.recommendSkip} 个连 GUI 工作区里都没有）` +
+      `—— 先问用户要不要恢复，别默默建目录`,
+    );
+  }
+
   out({
     ok: true,
     target: path.resolve(dest),
@@ -464,6 +649,9 @@ async function cmdCompare(argv) {
       exists: count("exists"),
       unresolvable: count("unresolvable"),
     },
+    projects: projectInfo.projects,
+    warnings: warn,
+    suggestedMap: projectInfo.summary.mapArg,
     // 分组给处理建议 —— 这是 AI 下一步要用的
     actions: {
       missing: rows.filter((r) => r.status === "missing").map((r) => r.relPath),
@@ -474,7 +662,9 @@ async function cmdCompare(argv) {
       "missing = 新机器没有，可直接放入；" +
       "different = 两边都有但内容不同，**先问用户**；" +
       "exists = 合并型，需按类型判断（见 IMPORT_GUIDE 冲突表）；" +
-      "unresolvable = 路径占位符没识别，需要你手动确定目标位置",
+      "unresolvable = 路径占位符没识别，需要你手动确定目标位置；" +
+      "**projects 里 remap 的项不是缺失，是路径搬家**（用 suggestedMap 重跑）；" +
+      "**absent 且 recommendSkip 的项默认不恢复** —— 本机没有对应工作区，恢复了也用不上",
   });
 }
 
@@ -511,6 +701,7 @@ async function cmdRate(argv) {
   }
 
   const rate = computeRecoveryRate(results);
+  const projectInfo = analyzeProjects(mf, dest, argOf(argv, "--settings"));
 
   // 自定义项单独列（它们的"恢复"靠 AI 判断，不能算进百分比）
   const customs = (mf.customItems || []).map((c) => ({
@@ -523,6 +714,8 @@ async function cmdRate(argv) {
   out({
     ok: true,
     target: path.resolve(dest),
+    projectSummary: projectInfo.summary,
+    suggestedMap: projectInfo.summary.mapArg,
     recovery: {
       // 两个数，别合成
       autoPassRate: rate.autoPassRate,
@@ -576,6 +769,33 @@ function readJsonl(p) {
   });
 }
 
+/**
+ * 两个会话文件是不是**同一个会话的身份**（同文件名，或声明了同一个 sessionId）。
+ *
+ * 光看「共享 uuid 为 0」不够 —— 把两个不相干的导出拼起来是**合法**用法
+ * （用户可能就是想合并两份互不重叠的记录）。危险的是这种组合：
+ * **同一个会话身份 + 零共享 uuid** —— 那说明 sessionId 被复用成了两段无关对话。
+ */
+function sessionIdentity(filePath, entries) {
+  const sessionIds = new Set();
+  for (const e of entries) {
+    const sid = e.obj && e.obj.sessionId;
+    if (typeof sid === "string" && sid) sessionIds.add(sid);
+  }
+  return { stem: path.basename(filePath, ".jsonl").toLowerCase(), sessionIds };
+}
+
+function isIdReuse(aPath, A, bPath, B, sharedUuids) {
+  if (sharedUuids !== 0) return false;
+  if (A.length === 0 || B.length === 0) return false;
+  const a = sessionIdentity(aPath, A);
+  const b = sessionIdentity(bPath, B);
+  const sameStem = !!a.stem && a.stem === b.stem;
+  let sameSid = false;
+  for (const s of a.sessionIds) if (b.sessionIds.has(s)) sameSid = true;
+  return sameStem || sameSid;
+}
+
 function cmdSessionDiff(argv) {
   const [a, b] = posArgs(argv);
   if (!a || !b) die("用法：session-diff <a.jsonl> <b.jsonl>");
@@ -593,10 +813,17 @@ function cmdSessionDiff(argv) {
   // 同 uuid 但内容不同 = 真冲突
   const conflicting = [...mapA.keys()].filter((u) => mapB.has(u) && mapA.get(u) !== mapB.get(u));
 
+  // 🔴 同一会话身份 + 零共享 uuid → sessionId 被复用成了两段无关对话
+  // （2026-11-15 实测：`56342174`，包内 11-06→11-09、本机 11-11→11-15，共享 uuid 0）。
+  // 按 uuid 合并会缝出跨越 9 天、上下文无关的怪东西，而且照样报 ok:true。
+  const shared = mapA.size - onlyA.length;
+  const idReuse = isIdReuse(a, A, b, B, shared);
+
   out({
     ok: true,
     a: { path: a, lines: A.length, uuids: mapA.size },
     b: { path: b, lines: B.length, uuids: mapB.size },
+    shared,
     onlyInA: { count: onlyA.length, sample: onlyA.slice(0, 5) },
     onlyInB: { count: onlyB.length, sample: onlyB.slice(0, 5) },
     conflicting: {
@@ -606,8 +833,16 @@ function cmdSessionDiff(argv) {
         ? "⚠️ 同一 uuid 但内容不同 —— **这是真冲突，必须问用户哪边是对的**"
         : "无同 uuid 内容冲突",
     },
-    hint:
-      onlyA.length || onlyB.length
+    idReuse: {
+      detected: idReuse,
+      note: idReuse
+        ? "🔴 两边**零个**共享 uuid —— 这不是同一会话的进度差异，是 sessionId 被复用。" +
+          "**不要合并**：另存为新的 sessionId（`session-fork --new-id`），两份都保留。"
+        : "共享 uuid 非零（或有一方为空），不构成 id 复用",
+    },
+    hint: idReuse
+      ? "🔴 禁止按 uuid 合并 —— 这是两段无关对话。先问用户，通常做法是另存一份（换新 sessionId）"
+      : onlyA.length || onlyB.length
         ? "两边有对方没有的轮次 → 可以按 uuid 合并（见 session-merge）"
         : "两边 uuid 集合一致",
   });
@@ -622,6 +857,29 @@ function cmdSessionMerge(argv) {
   const A = readJsonl(base);
   const B = readJsonl(other);
   const uuidOf = (e) => (e.obj && e.obj.uuid) || null;
+
+  // 🔴 撞名门控：同一会话身份 + 零共享 uuid → sessionId 被复用（两段无关对话）。
+  // 这种合并不会报冲突（没有同 uuid 不同内容），只会静默缝成一段跨天怪东西。
+  // 必须在建 seen 之前就拦下，别让"没有冲突"这个假信号放行。
+  {
+    const ua = new Set(A.map(uuidOf).filter(Boolean));
+    const ub = new Set(B.map(uuidOf).filter(Boolean));
+    let shared = 0;
+    for (const u of ua) if (ub.has(u)) shared++;
+    if (isIdReuse(base, A, other, B, shared)) {
+      out({
+        ok: false,
+        error: "同一会话身份、但两边**零个**共享 uuid —— 这是 sessionId 被复用，不是同一会话的两个进度",
+        a: { uuids: ua.size },
+        b: { uuids: ub.size },
+        shared: 0,
+        hint:
+          "**不要合并。** 用 `session-fork <包里的.jsonl> --new-id` 另存一份，" +
+          "两份都保留；然后问用户怎么处理。",
+      });
+      process.exit(2);
+    }
+  }
 
   const seen = new Map(); // uuid → line
   const order = [];       // 保持出现顺序
@@ -682,6 +940,52 @@ function cmdSessionMerge(argv) {
   });
 }
 
+/**
+ * 把一个会话另存为**新 sessionId**（撞名时的正确做法：两份都留着，不缝在一起）。
+ *
+ * ⚠️ 只改 `"sessionId":"..."` 字段，**不碰正文**。
+ * 2026-11-15 的教训：手工 `replaceAll` 整个文件，把消息正文里提到的 session id
+ * 也一起改了（48 处误伤）。对话内容里的 id 是历史事实，不该被改写。
+ */
+function cmdSessionFork(argv) {
+  const [src] = posArgs(argv);
+  const newId = argOf(argv, "--new-id");
+  const outPath = argOf(argv, "-o");
+  if (!src) die("用法：session-fork <会话.jsonl> [--new-id <uuid>] [-o <输出>]");
+
+  const newSessionId = newId || crypto.randomUUID();
+  const dest = outPath || path.join(path.dirname(src), `${newSessionId}.jsonl`);
+
+  const lines = fs.readFileSync(src, "utf8").split("\n").filter((l) => l.trim());
+  let touched = 0;
+  const rewritten = lines.map((l) => {
+    const n = l.replace(/"sessionId":"[^"]*"/g, `"sessionId":"${newSessionId}"`);
+    if (n !== l) touched++;
+    return n;
+  });
+
+  if (fs.existsSync(dest) && path.resolve(dest) !== path.resolve(src)) {
+    const bak = `${dest}.bak-${Date.now()}`;
+    fs.copyFileSync(dest, bak);
+  }
+  fs.writeFileSync(dest, rewritten.join("\n") + "\n", "utf8");
+
+  // 核对：正文里旧 id 的提及保留了多少（证明只改了字段）
+  const oldIds = new Set();
+  for (const l of lines) for (const m of l.matchAll(/"sessionId":"([^"]*)"/g)) oldIds.add(m[1]);
+
+  out({
+    ok: true,
+    source: path.resolve(src),
+    output: path.resolve(dest),
+    newSessionId,
+    lines: rewritten.length,
+    sessionIdFieldsRewritten: touched,
+    oldSessionIds: [...oldIds],
+    note: "只改了 sessionId 字段；消息正文里出现的旧 id 原样保留（那是历史内容）",
+  });
+}
+
 function cmdJsonMerge(argv) {
   const [a, b] = posArgs(argv);
   if (!a || !b) die("用法：json-merge <base.json> <other.json>");
@@ -732,6 +1036,7 @@ const COMMANDS = {
   extract: cmdExtract,
   "session-diff": cmdSessionDiff,
   "session-merge": cmdSessionMerge,
+  "session-fork": cmdSessionFork,
   "json-merge": cmdJsonMerge,
 };
 
@@ -759,4 +1064,5 @@ if (require.main === module) main();
 
 module.exports = {
   verifiabilityOf, computeRecoveryRate, resolveTarget, readFromPkg,
+  slugOfPath, analyzeProjects, readGuiWorkspaces, localProjectSlugs,
 };
