@@ -580,6 +580,13 @@ async function hashArchive(gzPath, opts = {}) {
   let pendingLongName = null;
   let stopped = false;
 
+  // `collect(relPath) → boolean`：顺带把匹配条目的正文收集到 `texts`。
+  // 恢复侧要判断「包内每一行是否都在目标文件里」，光有哈希不够；
+  // 但也不该为了读内容再整包扫一遍 —— 一次遍历同时产出哈希和正文。
+  const collect = typeof opts.collect === "function" ? opts.collect : null;
+  const texts = new Map();
+  let curText = null;
+
   let curRel = null;     // 正在算哈希的条目
   let curHash = null;
   let curSize = 0;
@@ -597,6 +604,10 @@ async function hashArchive(gzPath, opts = {}) {
     if (curRel !== null) {
       const v = { size: curDeclared, sha256: curHash.digest("hex") };
       out.set(curRel, v);
+      if (curText) {
+        texts.set(curRel, Buffer.concat(curText).toString("utf8"));
+        curText = null;
+      }
       if (opts.onEntry) opts.onEntry({ relPath: curRel, ...v });
       curRel = null;
       curHash = null;
@@ -638,6 +649,7 @@ async function hashArchive(gzPath, opts = {}) {
           if (curRemain > 0) {
             const take = Math.min(curRemain, buf.length - off);
             curHash.update(buf.subarray(off, off + take));
+            if (curText) curText.push(Buffer.from(buf.subarray(off, off + take)));
             off += take;
             curRemain -= take;
             curSize += take;
@@ -684,6 +696,8 @@ async function hashArchive(gzPath, opts = {}) {
             curDeclared = size;
             curRemain = size;
             curPadding = padding(size);
+            // 只有调用方点名要的条目才收集正文，其余照旧只算哈希
+            curText = collect && collect(clean) ? [] : null;
             if (size === 0) { finishCur(); curPadding = 0; }
           } else {
             // 目录 / 其它类型：没有正文要算
@@ -704,6 +718,9 @@ async function hashArchive(gzPath, opts = {}) {
     rs.pipe(gunzip);
   });
 
+  // 收集到的正文挂在返回值上（仍是 Map，`for..of` 迭代不受影响）。
+  // 命名成属性而不是改返回类型，避免动到 verify 等既有调用方。
+  if (collect) out.texts = texts;
   return out;
 }
 

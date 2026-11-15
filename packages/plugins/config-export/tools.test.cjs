@@ -490,3 +490,157 @@ test("analyzeProjects: 多个同名候选 → ambiguous，不替用户选", () =
   assert.strictEqual(r.projects[0].action, "ambiguous");
   assert.strictEqual(r.projects[0].candidates.length, 2);
 });
+
+// ══════════════════════════════════════════════════════════════
+// 追加型日志：包内行 ⊆ 目标行 就是好结果（2026-11-15）
+// ══════════════════════════════════════════════════════════════
+//
+// 真实事故：`history.jsonl` 874 行、`edit-history.jsonl` 9229 行，
+// 手工核对「包内每一行都在本机」，一行没丢；但按 sha256 判必然 different，
+// rate 一口气报了 8 个 fail —— 用错标准比没有标准更糟。
+
+test("subsetReport: 包内行全在目标里 → isSuperset（目标可以有更多行）", () => {
+  const { subsetReport } = require("./restore-tools.cjs");
+  const r = subsetReport('{"a":1}\n{"b":2}\n', '{"a":1}\n{"b":2}\n{"c":3}\n');
+  assert.strictEqual(r.isSuperset, true, "目标更全也算通过 —— 一行没丢");
+  assert.strictEqual(r.packageLines, 2);
+  assert.strictEqual(r.destLines, 3);
+  assert.strictEqual(r.missing, 0);
+});
+
+test("subsetReport: 少一行就不是超集，并报出缺几行", () => {
+  const { subsetReport } = require("./restore-tools.cjs");
+  const r = subsetReport('{"a":1}\n{"b":2}\n', '{"a":1}\n');
+  assert.strictEqual(r.isSuperset, false);
+  assert.strictEqual(r.missing, 1);
+  assert.strictEqual(r.missingSample.length, 1);
+});
+
+test("subsetReport: 行序不同但内容相同 → 仍算超集（不按行号比）", () => {
+  const { subsetReport } = require("./restore-tools.cjs");
+  const r = subsetReport('{"a":1}\n{"b":2}\n', '{"b":2}\n{"a":1}\n{"c":3}\n');
+  assert.strictEqual(r.isSuperset, true, "目标可能中途插过行，行号对不上但内容齐");
+});
+
+test("subsetReport: CRLF 不应造成假阴性", () => {
+  const { subsetReport } = require("./restore-tools.cjs");
+  const r = subsetReport('{"a":1}\n{"b":2}\n', '{"a":1}\r\n{"b":2}\r\n');
+  assert.strictEqual(r.isSuperset, true, "行尾差异不是「缺行」");
+});
+
+test("isAppendLog: 只认 history / edit-history，普通会话不算", () => {
+  const { isAppendLog } = require("./restore-tools.cjs");
+  assert.strictEqual(isAppendLog("claude/history.jsonl"), true);
+  assert.strictEqual(isAppendLog("claude/projects/X/edit-history.jsonl"), true);
+  assert.strictEqual(isAppendLog("claude/projects/X/abc-uuid.jsonl"), false, "会话是整份替换型");
+});
+
+// ══════════════════════════════════════════════════════════════
+// db-diff：只读、带 -wal、按主键
+// ══════════════════════════════════════════════════════════════
+
+function mkDb(file, rows) {
+  const { DatabaseSync } = require("node:sqlite");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const db = new DatabaseSync(file);
+  db.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)");
+  const st = db.prepare("INSERT INTO t (id,v) VALUES (?,?)");
+  for (const [id, v] of rows) st.run(id, v);
+  db.close();
+}
+
+test("db-diff: 报出 onlyInA / onlyInB / 同主键不同内容", () => {
+  const a = path.join(HOME, "dba.db");
+  const b = path.join(HOME, "dbb.db");
+  mkDb(a, [["1", "a"], ["2", "b"], ["3", "old"]]);
+  mkDb(b, [["1", "a"], ["3", "new"], ["4", "d"]]);
+  const r = run(["db-diff", a, b]);
+  assert.strictEqual(r.ok, true);
+  const t = r.tables.find((x) => x.table === "t");
+  assert.strictEqual(t.key, "id", "应按主键比对，不是按行号");
+  assert.strictEqual(t.onlyInA.count, 1, "id=2 只在 A");
+  assert.strictEqual(t.onlyInB.count, 1, "id=4 只在 B");
+  assert.strictEqual(t.differing.count, 1, "id=3 同主键不同内容");
+});
+
+test("db-diff: 两边完全一致 → 三个计数都是 0", () => {
+  const a = path.join(HOME, "dbc.db");
+  const b = path.join(HOME, "dbd.db");
+  mkDb(a, [["1", "x"], ["2", "y"]]);
+  mkDb(b, [["1", "x"], ["2", "y"]]);
+  const r = run(["db-diff", a, b]);
+  assert.strictEqual(r.onlyInA.count, 0);
+  assert.strictEqual(r.onlyInB.count, 0);
+  assert.strictEqual(r.differing.length, 0);
+});
+
+test("db-diff: 库正被占用、新行只在 -wal 里时仍能读到", () => {
+  // ⚠️ 这个测试必须让连接**保持打开**。
+  // 先前写成 close() 之后比对 —— 而 close() 会把 WAL checkpoint 进主文件、
+  // 连 -wal 都删掉，于是无论实现有没有复制 -wal 都通过（变异验证实测：
+  // 去掉复制 -wal 的代码，48 个测试照样全绿 = 假绿）。
+  // 真实场景恰恰是「GUI 正开着库」，此时 -wal 里有尚未落盘的写入。
+  const { DatabaseSync } = require("node:sqlite");
+  const a = path.join(HOME, "dbe.db");
+  const b = path.join(HOME, "dbf.db");
+  mkDb(a, [["1", "x"]]);
+
+  const db = new DatabaseSync(b);
+  db.exec("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT)");
+  db.prepare("INSERT INTO t (id,v) VALUES (?,?)").run("1", "x");
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec("PRAGMA wal_autocheckpoint=0");
+  db.prepare("INSERT INTO t (id,v) VALUES (?,?)").run("2", "y");
+
+  try {
+    // 连接仍然开着：此刻 id=2 只存在于 -wal
+    assert.ok(fs.existsSync(b + "-wal"), "前提：-wal 此时应存在");
+    const r = run(["db-diff", a, b]);
+    const t = r.tables.find((x) => x.table === "t");
+    assert.strictEqual(t.onlyInB.count, 1, "只复制主文件会丢掉 WAL 里的新行");
+  } finally {
+    db.close();
+  }
+});
+
+test("db-diff: 找不到文件 → 明确报错，不静默返回空", () => {
+  const r = run(["db-diff", path.join(HOME, "nope.db"), path.join(HOME, "nope2.db")]);
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.error.includes("找不到数据库"));
+});
+
+// ══════════════════════════════════════════════════════════════
+// plan：把比对结果翻译成逐条动作
+// ══════════════════════════════════════════════════════════════
+
+test("decideActions: 各状态映射到正确动作", () => {
+  const { decideActions } = require("./restore-tools.cjs");
+  const mk = (status, extra = {}) =>
+    decideActions({ status, relPath: "x/y.md", category: "c", ...extra }).action;
+  assert.strictEqual(mk("missing"), "copy", "目标没有 → 直接放");
+  assert.strictEqual(mk("identical"), "skip");
+  assert.strictEqual(mk("superset"), "skip", "追加型全包含 → 不用动");
+  assert.strictEqual(mk("exists"), "ask", "合并型 → 问");
+  assert.strictEqual(mk("different"), "ask");
+  assert.strictEqual(mk("unresolvable"), "ask");
+});
+
+test("decideActions: SQLite 主库建议 db-diff，WAL 附属直接跳过", () => {
+  const { decideActions } = require("./restore-tools.cjs");
+  const db = decideActions({ status: "different", relPath: "a/notes.db", category: "c" });
+  assert.strictEqual(db.action, "ask");
+  assert.strictEqual(db.suggest, "db-diff", "二进制库不该整库替换，先看行级差异");
+
+  const wal = decideActions({ status: "different", relPath: "a/notes.db-wal", category: "c" });
+  assert.strictEqual(wal.action, "skip", "WAL 跟着主库走，单独复制会让库不一致");
+});
+
+test("plan: 输出逐条动作 + 汇总", () => {
+  const r = run(["plan", PKG, "--dest", path.join(HOME, "plan-dest")]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.summary.total, r.actions.length);
+  for (const a of r.actions) {
+    assert.ok(["copy", "skip", "replace", "merge", "ask"].includes(a.action), `未知动作 ${a.action}`);
+    assert.ok(a.why, "每条动作都要说明为什么");
+  }
+});

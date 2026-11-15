@@ -142,7 +142,7 @@ function argOf(argv, name, def = undefined) {
 }
 
 function posArgs(argv) {
-  const flags = new Set(["--dest", "-o", "--name", "--map", "--settings", "--new-id"]);
+  const flags = new Set(["--dest", "-o", "--name", "--map", "--settings", "--new-id", "--tables", "--only"]);
   const out = [];
   for (let i = 0; i < argv.length; i++) {
     if (flags.has(argv[i])) { i++; continue; }
@@ -353,8 +353,53 @@ async function cmdVerify(argv) {
   });
 }
 
+/**
+ * 这个条目是「按行追加型」而不是「整份替换型」吗？
+ *
+ * `.jsonl` 的日志类文件（history / edit-history）天然只增不减：
+ * 目标机上有、且是包的超集，就是**最理想的结果** —— 一行没丢。
+ * 拿 sha256 判它必然报 different，那是在用错标准（2026-11-15 实测：
+ * 874 行和 9229 行都「全在」，rate 却报 8 个 fail）。
+ */
+function isAppendLog(relPath) {
+  return /(^|\/)(history|edit-history)\.jsonl$/.test(relPath);
+}
+
+/** 把 JSONL 文本切成非空行集合（去 CRLF，避免行尾差异造成假阴性） */
+function jsonlLines(text) {
+  return String(text).replace(/\r\n/g, "\n").split("\n").filter((l) => l.trim());
+}
+
+/**
+ * 判断「包内每一行是否都在目标文件里」（子集判定）。
+ *
+ * 这是追加型文件的正确判据：
+ *   · 包行 ⊆ 目标行  → 包里有的目标全有 = 没丢东西（目标可能有更多）
+ *   · 否则          → 确实缺行，报出缺了多少
+ *
+ * 用行内容本身当键，不按行号 —— 目标可能在中途插过行，行号对不上但内容齐。
+ */
+function subsetReport(packageText, destText) {
+  const pkg = jsonlLines(packageText);
+  const dest = new Set(jsonlLines(destText));
+  let contained = 0;
+  const missingSample = [];
+  for (const l of pkg) {
+    if (dest.has(l)) contained++;
+    else if (missingSample.length < 5) missingSample.push(l.slice(0, 120));
+  }
+  return {
+    packageLines: pkg.length,
+    destLines: dest.size,
+    contained,
+    missing: pkg.length - contained,
+    isSuperset: pkg.length > 0 && contained === pkg.length,
+    missingSample,
+  };
+}
+
 /** 检查某个条目在 dest 下的状态（用于 --dest 模式） */
-async function checkDest(it, destRoot, map) {
+async function checkDest(it, destRoot, map, pkgTexts) {
   const target = it.restore && it.restore.target;
   if (!target) return { status: "unknown" };
   const level = verifiabilityOf(it.restore.mode);
@@ -367,9 +412,44 @@ async function checkDest(it, destRoot, map) {
   if (!exists) return { status: "missing", path: real };
 
   if (level !== "exact") {
-    // 合并/追加型：内容必然不同，不能比 sha —— 也不用去读大文件
+    // 合并型（记忆 / 二进制库）：内容**预期**不同，不能拿 sha 当判据。
+    // 但如果两边**恰好逐字节相同**，那就不用问了 —— 先排除掉这部分，
+    // 剩下的才是真要人工判断的（2026-11-15：558 个记忆里 428 个已存在，
+    // 全都报「要问用户」，实际其中大部分内容一致，没人看得过来）。
+    const same = await sha256File(real).catch(() => null);
+    if (same && it.sha256 && same === it.sha256) {
+      return { status: "identical", path: real, note: "合并型但内容已完全相同" };
+    }
     return { status: "exists", path: real, note: "合并型，内容预期不同（无法用 sha 比对）" };
   }
+
+  // 追加型日志：走子集判定，而不是 sha256
+  if (isAppendLog(it.relPath)) {
+    const pkgText = pkgTexts && pkgTexts.get(it.relPath);
+    if (pkgText == null) {
+      return {
+        status: "unknown",
+        path: real,
+        note: "追加型日志但没有包内正文（未启用内容收集）",
+      };
+    }
+    let destText = "";
+    try {
+      destText = await fsp.readFile(real, "utf8");
+    } catch {
+      return { status: "different", path: real, note: "目标不可读" };
+    }
+    const r = subsetReport(pkgText, destText);
+    return {
+      status: r.isSuperset ? "superset" : "different",
+      path: real,
+      subset: r,
+      note: r.isSuperset
+        ? `包内 ${r.packageLines} 行全在目标里（目标 ${r.destLines} 行，可含更多）`
+        : `包内 ${r.packageLines} 行里有 ${r.missing} 行不在目标中`,
+    };
+  }
+
   const actual = await sha256File(real);
   return {
     status: actual === it.sha256 ? "identical" : "different",
@@ -601,6 +681,27 @@ function analyzeProjects(mf, destRoot, settingsPath) {
   };
 }
 
+/**
+ * 一次遍历读出「追加型日志」的包内正文。
+ *
+ * 只收集 manifest 里确实是追加型的条目 —— 其余照旧只算哈希，
+ * 不会为了这点判断把 900MB 包整个读进内存。
+ */
+async function loadAppendLogTexts(pkg, items) {
+  const wanted = new Set(
+    (items || []).map((i) => i.relPath).filter((p) => p && isAppendLog(p)),
+  );
+  if (wanted.size === 0) return new Map();
+  const hashes = await require("./tar-writer.cjs").hashArchive(path.resolve(pkg), {
+    // 归档内的条目名带 `data/` 前缀，manifest 的 relPath 不带
+    collect: (n) => wanted.has(n.replace(/^data\//, "")),
+  });
+  const out = new Map();
+  const texts = hashes.texts || new Map();
+  for (const [k, v] of texts) out.set(k.replace(/^data\//, ""), v);
+  return out;
+}
+
 async function cmdCompare(argv) {
   const [pkg] = posArgs(argv);
   const dest = argOf(argv, "--dest");
@@ -608,9 +709,10 @@ async function cmdCompare(argv) {
   const mf = await readManifest(pkg);
 
   const map = parseMap(argv);
+  const pkgTexts = await loadAppendLogTexts(pkg, mf.items);
   const rows = [];
   for (const it of mf.items || []) {
-    const d = await checkDest(it, dest, map);
+    const d = await checkDest(it, dest, map, pkgTexts);
     rows.push({
       relPath: it.relPath,
       category: it.category,
@@ -645,6 +747,7 @@ async function cmdCompare(argv) {
     summary: {
       missing: count("missing"),
       identical: count("identical"),
+      superset: count("superset"),
       different: count("different"),
       exists: count("exists"),
       unresolvable: count("unresolvable"),
@@ -662,6 +765,7 @@ async function cmdCompare(argv) {
       "missing = 新机器没有，可直接放入；" +
       "different = 两边都有但内容不同，**先问用户**；" +
       "exists = 合并型，需按类型判断（见 IMPORT_GUIDE 冲突表）；" +
+      "superset = 追加型日志，包内**每一行都在目标里**（目标可有更多行）—— 这是好结果，不是差异；" +
       "unresolvable = 路径占位符没识别，需要你手动确定目标位置；" +
       "**projects 里 remap 的项不是缺失，是路径搬家**（用 suggestedMap 重跑）；" +
       "**absent 且 recommendSkip 的项默认不恢复** —— 本机没有对应工作区，恢复了也用不上",
@@ -675,17 +779,19 @@ async function cmdRate(argv) {
   const mf = await readManifest(pkg);
 
   const map = parseMap(argv);
+  const pkgTexts = await loadAppendLogTexts(pkg, mf.items);
   const results = [];
   const detail = [];
   for (const it of mf.items || []) {
     const mode = (it.restore && it.restore.mode) || "overwrite";
     const level = verifiabilityOf(mode);
-    const d = await checkDest(it, dest, map);
+    const d = await checkDest(it, dest, map, pkgTexts);
 
     let verified;
     if (level === "unverifiable") {
       verified = "skipped"; // 无法自动验证
-    } else if (d.status === "identical" || d.status === "exists") {
+    } else if (d.status === "identical" || d.status === "exists" || d.status === "superset") {
+      // superset：追加型日志，包内每一行都在目标里 —— 一行没丢，就是通过
       verified = "pass";
     } else {
       verified = "fail";
@@ -736,6 +842,243 @@ async function cmdRate(argv) {
       "「自动验证通过率」回答『能验的都验过了吗』；" +
       "「整体覆盖率」回答『还有多少要人看』。" +
       "合并成一个数会掩盖『记忆文件根本没验』这个事实。",
+  });
+}
+
+/**
+ * 打开一个 SQLite 库做**只读**比对。
+ *
+ * 🔴 两个必踩的坑（2026-11-15 实测）：
+ *   1. **GUI 可能正开着库** —— 直接 `connect` 可能拿不到一致快照。
+ *      所以先把库连同 `-wal` / `-shm` 复制到临时目录再读。
+ *      WAL 模式下**只复制主文件会丢掉最近写入**，看到的是旧数据。
+ *   2. 不要用 `mode=ro` 打开原文件 —— Windows 上文件被占用时直接失败。
+ *      复制出来再打开，既能读全，也不干扰正在跑的 GUI。
+ */
+function openDbCopy(p) {
+  const { DatabaseSync } = require("node:sqlite");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dbdiff-"));
+  const copy = path.join(tmpDir, path.basename(p));
+  fs.copyFileSync(p, copy);
+  for (const suf of ["-wal", "-shm"]) {
+    if (fs.existsSync(p + suf)) fs.copyFileSync(p + suf, copy + suf);
+  }
+  const db = new DatabaseSync(copy, { readOnly: true });
+  return { db, cleanup: () => { try { db.close(); } catch { /* 已关 */ } fs.rmSync(tmpDir, { recursive: true, force: true }); } };
+}
+
+/** 选出可以当主键的列：优先单列主键，其次第一列 */
+function primaryKeyOf(db, table) {
+  try {
+    const cols = db.prepare(`PRAGMA table_info("${table}")`).all();
+    const pk = cols.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk);
+    if (pk.length === 1) return { key: pk[0].name, composite: null };
+    if (pk.length > 1) return { key: null, composite: pk.map((c) => c.name) };
+    return cols.length ? { key: cols[0].name, composite: null } : { key: null, composite: null };
+  } catch {
+    return { key: null, composite: null };
+  }
+}
+
+function rowKey(row, { key, composite }) {
+  if (key) return String(row[key]);
+  if (composite) return composite.map((c) => String(row[c])).join("\u0000");
+  return JSON.stringify(row);
+}
+
+/**
+ * 比对两个 SQLite 库的行级差异。
+ *
+ * 为什么需要它：GUIDE 说 `data.db` / `notes.db`「无法自动合并（SQLite 二进制）」
+ * 所以必须整库替换、必须问用户。但实际按主键 diff 完，2026-11-15 那次
+ * 只多 1 条笔记 + 33 条 plans + 1 桌面 + 1 卡片，**零冲突** ——
+ * 「要不要整库替换」这个只能靠赌的问题，本该是「这一条要不要插入」这个能答的问题。
+ */
+function diffDb(aPath, bPath, tables) {
+  const A = openDbCopy(aPath);
+  const B = openDbCopy(bPath);
+  try {
+    const listTables = (db) =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .all().map((r) => r.name);
+
+    const ta = new Set(listTables(A.db));
+    const tb = new Set(listTables(B.db));
+    const wanted = tables && tables.length
+      ? tables
+      : [...new Set([...ta, ...tb])].filter((t) => ta.has(t) && tb.has(t) && !/_fts/.test(t));
+
+    const result = { tables: [], onlyInA: { count: 0 }, onlyInB: { count: 0 }, differing: [] };
+
+    for (const t of wanted) {
+      if (!ta.has(t) || !tb.has(t)) {
+        result.tables.push({ table: t, present: { a: ta.has(t), b: tb.has(t) }, skipped: "表只在一侧存在" });
+        continue;
+      }
+      const pk = primaryKeyOf(A.db, t);
+      const ra = A.db.prepare(`SELECT * FROM "${t}"`).all();
+      const rb = B.db.prepare(`SELECT * FROM "${t}"`).all();
+      const ma = new Map(ra.map((r, i) => [rowKey(r, pk) ?? `#${i}`, r]));
+      const mb = new Map(rb.map((r, i) => [rowKey(r, pk) ?? `#${i}`, r]));
+
+      const onlyA = [...ma.keys()].filter((k) => !mb.has(k));
+      const onlyB = [...mb.keys()].filter((k) => !ma.has(k));
+      const diff = [...ma.keys()].filter(
+        (k) => mb.has(k) && JSON.stringify(ma.get(k)) !== JSON.stringify(mb.get(k)),
+      );
+
+      result.tables.push({
+        table: t,
+        key: pk.composite ? pk.composite.join("+") : pk.key,
+        aRows: ra.length,
+        bRows: rb.length,
+        onlyInA: { count: onlyA.length, sample: onlyA.slice(0, 5) },
+        onlyInB: { count: onlyB.length, sample: onlyB.slice(0, 5) },
+        differing: { count: diff.length, sample: diff.slice(0, 5) },
+      });
+      result.onlyInA.count += onlyA.length;
+      result.onlyInB.count += onlyB.length;
+      if (diff.length) result.differing.push({ table: t, count: diff.length, sample: diff.slice(0, 5) });
+    }
+    return result;
+  } finally {
+    A.cleanup();
+    B.cleanup();
+  }
+}
+
+function cmdDbDiff(argv) {
+  const [a, b] = posArgs(argv);
+  const tables = argOf(argv, "--tables");
+  if (!a || !b) die("用法：db-diff <A.db> <B.db> [--tables t1,t2]");
+  for (const p of [a, b]) {
+    if (!fs.existsSync(p)) die(`找不到数据库：${p}`);
+  }
+  const r = diffDb(a, b, tables ? String(tables).split(",").map((s) => s.trim()).filter(Boolean) : null);
+  out({
+    ok: true,
+    a: path.resolve(a),
+    b: path.resolve(b),
+    ...r,
+    hint:
+      "onlyInA = 只有 A（源）有 → 恢复时要**插入**；" +
+      "onlyInB = 只有 B（目标）有 → 保留，不要删；" +
+      "differing = 同主键但内容不同 → **问用户哪边是对的**。" +
+      "三者为零差异时才可以直接整库替换；否则增量插入更安全（不必停掉正在用库的 GUI）。",
+  });
+}
+
+/**
+ * 把一次比对结果翻译成**逐条动作**，而不是一堆状态码。
+ *
+ * 这是 GUIDE 要求的第一步（"把恢复方案给用户看，确认后再动手"），
+ * 却一直没人固化 —— 每次都得让 AI 临场拼。而拼出来的东西每次都不同，
+ * 用户也就没法比较两次恢复方案的差别。
+ *
+ * 动作取值：
+ *   copy     目标不存在 → 直接放入
+ *   skip     已一致 → 不用动
+ *   replace  目标存在且 B 是 A 的严格超集 → 用 A 覆盖（源更全）
+ *   merge    追加型日志，A 的每一行都在 B 里 → 已合并，不用动
+ *   ask      真冲突 / 撞名 / 二进制库 → **问用户**，后面注明原因
+ */
+function decideActions(row, it) {
+  const base = {
+    relPath: row.relPath,
+    category: row.category,
+    target: row.path || null,
+  };
+  switch (row.status) {
+    case "missing":
+      return { ...base, action: "copy", why: "目标机没有" };
+    case "identical":
+    case "superset":
+      return {
+        ...base,
+        action: "skip",
+        why: row.status === "superset"
+          ? `追加型：包内 ${row.subset && row.subset.packageLines} 行全在目标里`
+          : "内容已完全一致",
+      };
+    case "exists":
+      return { ...base, action: "ask", why: "合并型文件，需要按内容类型决定（见冲突表）" };
+    case "different": {
+      // 追加型日志缺行 → 可以按行补
+      if (row.subset) {
+        return {
+          ...base,
+          action: "ask",
+          why: `追加型日志缺 ${row.subset.missing} 行，可补行但顺序需确认`,
+        };
+      }
+      // .db 是二进制 → 不能整库替换，先看行级差异
+      if (/\.db$/.test(row.relPath)) {
+        return {
+          ...base,
+          action: "ask",
+          why:
+            "SQLite 二进制，整库替换会覆盖目标机的新数据。" +
+            "先跑 `db-diff <包内库> <目标库>` —— 若 onlyInA 有行就增量插入，通常零冲突",
+          suggest: "db-diff",
+        };
+      }
+      // WAL 附属文件跟着主库走，单独判断没有意义
+      if (/\.db-(wal|shm)$/.test(row.relPath)) {
+        return {
+          ...base,
+          action: "skip",
+          why: "WAL 附属文件；跟主库一起处理，不单独复制（复制了反而可能让库不一致）",
+        };
+      }
+      // 会话 jsonl：同 sessionId 不同内容 → 必须问
+      return { ...base, action: "ask", why: "两边都有但内容不同" };
+    }
+    case "unresolvable":
+      return { ...base, action: "ask", why: "路径占位符没识别，需手动确定位置" };
+    default:
+      return { ...base, action: "ask", why: `状态未知（${row.status}）` };
+  }
+}
+
+async function cmdPlan(argv) {
+  const [pkg] = posArgs(argv);
+  const dest = argOf(argv, "--dest");
+  if (!pkg || !dest) die("用法：plan <包路径> --dest <目标根目录>");
+  const mf = await readManifest(pkg);
+
+  const map = parseMap(argv);
+  const pkgTexts = await loadAppendLogTexts(pkg, mf.items);
+  const items = mf.items || [];
+  const rows = [];
+  for (const it of items) {
+    const d = await checkDest(it, dest, map, pkgTexts);
+    rows.push(decideActions({ ...d, relPath: it.relPath, category: it.category }, it));
+  }
+
+  const projectInfo = analyzeProjects(mf, dest, argOf(argv, "--settings"));
+  const byAction = {};
+  for (const r of rows) byAction[r.action] = (byAction[r.action] || 0) + 1;
+
+  const bytesOf = (act) =>
+    items.filter((_, i) => rows[i].action === act).reduce((a, it) => a + (it.size || 0), 0);
+
+  out({
+    ok: true,
+    target: path.resolve(dest),
+    summary: {
+      ...byAction,
+      total: rows.length,
+      copyBytes: bytesOf("copy"),
+    },
+    projects: projectInfo.projects,
+    suggestedMap: projectInfo.summary.mapArg,
+    // 逐条动作 —— 这就是"给用户看的方案"
+    actions: rows,
+    hint:
+      "**这份输出就是给用户确认的方案**，不要直接开干。" +
+      "copy = 直接放；skip = 不用动；ask = 必须问用户（why 里写了为什么）。" +
+      "projects 里 recommendSkip 的整项建议跳过（本机连工作区都没有）。" +
+      "确认后按动作执行，破坏性操作前先备份。",
   });
 }
 
@@ -1032,11 +1375,13 @@ const COMMANDS = {
   list: cmdList,
   verify: cmdVerify,
   compare: cmdCompare,
+  plan: cmdPlan,
   rate: cmdRate,
   extract: cmdExtract,
   "session-diff": cmdSessionDiff,
   "session-merge": cmdSessionMerge,
   "session-fork": cmdSessionFork,
+  "db-diff": cmdDbDiff,
   "json-merge": cmdJsonMerge,
 };
 
@@ -1065,4 +1410,5 @@ if (require.main === module) main();
 module.exports = {
   verifiabilityOf, computeRecoveryRate, resolveTarget, readFromPkg,
   slugOfPath, analyzeProjects, readGuiWorkspaces, localProjectSlugs,
+  isAppendLog, jsonlLines, subsetReport, decideActions, diffDb,
 };
