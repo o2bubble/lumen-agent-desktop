@@ -229,14 +229,27 @@ slug 必须与主仓 `src/utils/sessionStoragePortable.ts:311` 的 `sanitizePath
 |---|---|
 | `list <包>` | 包里有什么（分类/文件数/大小/自定义项/下一步建议） |
 | `verify <包>` | 包完整性（逐个 sha256 比对） |
-| `compare <包> --dest <dir>` | 包内容 vs 新机器现状（missing / different / exists / unresolvable） |
+| `plan <包> --dest <dir>` | **逐条动作**（copy / skip / ask + 每条为什么）—— 先给用户看这个 |
+| `compare <包> --dest <dir>` | 包内容 vs 新机器现状（missing / identical / superset / different / exists） |
 | `rate <包> --dest <dir>` | **恢复率**（见下） |
 | `extract <包> --dest <dir>` | 解包（只解，不放到目标位置） |
-| `session-diff <a> <b>` | 两个会话文件差异（按 uuid，能识别真冲突） |
-| `session-merge <a> <b> -o <out>` | 按 uuid 合并（自动备份；有真冲突时**拒绝合并**） |
+| `session-diff <a> <b>` | 两个会话文件差异（按 uuid；同会话身份+零共享 uuid 会报 `idReuse`） |
+| `session-merge <a> <b> -o <out>` | 按 uuid 合并（自动备份；真冲突或 id 复用时**拒绝合并**） |
+| `session-fork <src> [--new-id <u>]` | 撞名时另存为新 sessionId（只改字段，不动正文） |
+| `db-diff <A.db> <B.db>` | SQLite 行级差异（只读、连 `-wal` 一起读，按主键报 onlyA/onlyB/冲突） |
 | `json-merge <a> <b>` | 两个 JSON 按键合并的**预览**（不写盘） |
 
 全部输出 JSON；出错时 exit code ≠ 0 且 stdout 也有 `{ok:false,error}`。
+
+**先跑 `plan` 再动手** —— 它把状态码翻译成动作，`ask` 的条目都带 `why`，
+直接念给用户就能确认。`compare` / `rate` 还会输出 `projects[]`
+（`exact` / `remap` / `absent`）和 `suggestedMap`：工作区搬过家时
+slug 会全变，**整类 missing 不等于文件缺失**，那是要重映射。
+`absent` 且 `recommendSkip` 的项目本机连工作区都没有 —— **建议跳过**。
+
+`superset` 是追加型日志（`history.jsonl` / `edit-history.jsonl`）的好结果：
+包内每一行都在目标里，目标可以有更多行。**别拿 sha256 判这类文件** ——
+它们只增不减，整份哈希永远对不上，会误报成「恢复失败」。
 
 ### 🔴 恢复率：报**两个**数，不要合成一个
 
